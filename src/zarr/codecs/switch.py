@@ -45,7 +45,7 @@ from zarr.core.common import JSON, parse_named_configuration
 if TYPE_CHECKING:
     from typing import Self
 
-    from zarr.abc.codec import Codec, CodecPipeline
+    from zarr.abc.codec import Codec
     from zarr.abc.store import ByteGetter, ByteRequest
     from zarr.core.array_spec import ArraySpec
     from zarr.core.buffer import Buffer, BufferPrototype, NDBuffer
@@ -75,22 +75,73 @@ def _json_number(v: float) -> JSON:
     return "NaN" if np.isnan(v) else ("Infinity" if v > 0 else "-Infinity")
 
 
-@lru_cache(maxsize=4096)
-def _completed(codecs: str, values: tuple[float | int, ...]) -> tuple[Codec, ...]:
-    """A case's codecs with its parameters filled in, parsed. Cached, so chunks that
-    share a case and its values share one parse."""
+def _fill(node: Any, values: tuple[float | int, ...]) -> Any:
+    """`node` with every `{"parameter": k}` replaced by the k-th value."""
+    if isinstance(node, dict):
+        if set(node) == {"parameter"}:
+            return _json_number(values[node["parameter"]])
+        return {k: _fill(v, values) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_fill(v, values) for v in node]
+    return node
+
+
+def _has_slots(node: Any) -> bool:
+    if isinstance(node, dict):
+        return set(node) == {"parameter"} or any(_has_slots(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_slots(v) for v in node)
+    return False
+
+
+@lru_cache(maxsize=1024)
+def _case_codecs(codecs: str) -> tuple[Codec | str, ...]:
+    """A case's codecs: each parsed once if it has no open values, else kept as its
+    JSON text, to be parsed per chunk with the chunk's values."""
     from zarr.core.metadata.v3 import parse_codecs
 
-    def fill(node: Any) -> Any:
-        if isinstance(node, dict):
-            if set(node) == {"parameter"}:
-                return _json_number(values[node["parameter"]])
-            return {k: fill(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [fill(v) for v in node]
-        return node
+    return tuple(
+        json.dumps(node) if _has_slots(node) else parse_codecs([node])[0]
+        for node in json.loads(codecs)
+    )
 
-    return tuple(parse_codecs(fill(json.loads(codecs))))
+
+@lru_cache(maxsize=4096)
+def _evolved(codecs: str, position: int, spec: ArraySpec) -> Codec:
+    """A case's codec without open values, evolved for the spec it sees. Keyed on that
+    spec, so a parameter that changes what downstream codecs see only misses the cache."""
+    codec = _case_codecs(codecs)[position]
+    if isinstance(codec, str):
+        raise TypeError("switch: a codec with open values is built per chunk")
+    return codec.evolve_from_array_spec(spec)
+
+
+def _chain(
+    codecs: str, values: tuple[float | int, ...], chunk_spec: ArraySpec
+) -> tuple[Codec, ...]:
+    """A case's codecs with the chunk's values, each evolved for the spec it sees.
+
+    Only the codecs with open values are parsed and evolved per chunk; the others come
+    from the cache. Equivalent to parsing the filled-in chain and running
+    `evolve_codecs` on it.
+    """
+    from zarr.core.metadata.v3 import parse_codecs
+
+    out: list[Codec] = []
+    spec = chunk_spec
+    for position, codec in enumerate(_case_codecs(codecs)):
+        if isinstance(codec, str):
+            (built,) = parse_codecs([_fill(json.loads(codec), values)])
+            evolved = built.evolve_from_array_spec(spec)
+        else:
+            evolved = _evolved(codecs, position, spec)
+        out.append(evolved)
+        spec = evolved.resolve_metadata(spec)
+        if not isinstance(spec.fill_value, np.generic):
+            # e.g. scale_offset's NaN as a Python float: NaN != NaN would miss the cache
+            # on every chunk, while ArraySpec compares numpy scalars by their bytes
+            spec = replace(spec, fill_value=spec.dtype.cast_scalar(spec.fill_value))
+    return tuple(out)
 
 
 def _is_total(selection: SelectorTuple, shape: tuple[int, ...]) -> bool:
@@ -235,26 +286,22 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         return KEY_BYTES + sum(np.dtype(d).itemsize for d in params)
 
     @staticmethod
-    def _pipeline(
-        codecs: str, values: tuple[float | int, ...], chunk_spec: ArraySpec
-    ) -> CodecPipeline:
-        from zarr.registry import get_pipeline_class
+    async def _decode_chain(
+        chain: tuple[Codec, ...], data: Buffer, chunk_spec: ArraySpec
+    ) -> NDBuffer:
+        # one chunk through an already-evolved chain, without building a pipeline
+        # shortcut: always the async per-chunk transform, whatever
+        # `codec_pipeline.path` names; the decoded values are the same.
+        from zarr.core.codec_pipeline import AsyncChunkTransform
 
-        return (
-            get_pipeline_class()
-            .from_codecs(_completed(codecs, values))
-            .evolve_from_array_spec(chunk_spec)
-        )
+        return await AsyncChunkTransform(codecs=chain).decode_chunk(data, chunk_spec)
 
     async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
         codecs, params = self._case(chunk_bytes[:KEY_BYTES].to_bytes())
         size = self._header_size(params)
         values = self._values(chunk_bytes[KEY_BYTES:size].to_bytes(), params)
-        pipeline = self._pipeline(codecs, values, chunk_spec)
-        (out,) = await pipeline.decode([(chunk_bytes[size:], chunk_spec)])
-        if out is None:
-            raise ValueError("switch: the case's chain decoded the chunk to nothing")
-        return out
+        chain = _chain(codecs, values, chunk_spec)
+        return await self._decode_chain(chain, chunk_bytes[size:], chunk_spec)
 
     async def _decode_partial_single(
         self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
@@ -278,20 +325,17 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                 return None
             values = self._values(raw.to_bytes(), params)
         body = _HeaderSkippingByteGetter(byte_getter, size)
-        chain = _completed(codecs, values)
+        chain = _chain(codecs, values, chunk_spec)
         if len(chain) == 1 and isinstance(chain[0], ArrayBytesCodecPartialDecodeMixin):
             # a lone partial-decode codec (sharding): the same rule as the pipelines'
-            codec = chain[0].evolve_from_array_spec(chunk_spec)
-            (part,) = await codec.decode_partial([(body, selection, chunk_spec)])
+            (part,) = await chain[0].decode_partial([(body, selection, chunk_spec)])
             return part
-        pipeline = self._pipeline(codecs, values, chunk_spec)
         # shortcut: a partial read of a case without partial decode costs a request
         # for the header and one for the body, against one without switch.
         buf = await body.get(prototype=prototype)
         if buf is None:
             return None
-        (out,) = await pipeline.decode([(buf, chunk_spec)])
-        return None if out is None else out[selection]
+        return (await self._decode_chain(chain, buf, chunk_spec))[selection]
 
     async def _encode_single(self, chunk_array: NDBuffer, chunk_spec: ArraySpec) -> Buffer | None:
         raise NotImplementedError(

@@ -226,3 +226,53 @@ def test_switch_does_not_encode() -> None:
     put(store, "zarr.json", array_doc([2], regular([2]), [switch(case)]))
     with pytest.raises(NotImplementedError, match="switch decodes only"):
         zarr.open_array(store, mode="r+")[...] = 1.0
+
+
+def test_cached_chain_equals_a_fresh_parse_and_evolve() -> None:
+    """Only codecs with open values are built per chunk; the result must be what parsing
+    the filled-in chain and evolving it would give."""
+    from zarr.codecs.switch import _chain, _fill
+    from zarr.core.array_spec import ArrayConfig, ArraySpec
+    from zarr.core.chunk_utils import evolve_codecs
+    from zarr.core.dtype import Float32
+    from zarr.core.metadata.v3 import parse_codecs
+
+    codecs = [
+        {
+            "name": "scale_offset",
+            "configuration": {"offset": {"parameter": 0}, "scale": {"parameter": 1}},
+        },
+        {
+            "name": "cast_value",
+            "configuration": {
+                "data_type": "int16",
+                "scalar_map": {"encode": [["NaN", -1]], "decode": [[-1, "NaN"]]},
+            },
+        },
+        *GZIP,
+    ]
+    spec = ArraySpec(
+        shape=(4, 6),
+        dtype=Float32(),
+        fill_value=np.float32("nan"),
+        config=ArrayConfig.from_dict({}),
+        prototype=default_buffer_prototype(),
+    )
+    for values in [(280.0, 100.0), (270.0, 50.0), (280.0, 100.0)]:
+        want = evolve_codecs(parse_codecs(_fill(codecs, values)), spec)
+        assert _chain(json.dumps(codecs), values, spec) == want
+
+
+def test_a_parameter_that_changes_downstream_specs() -> None:
+    """`crop`'s stored shape as a parameter: each chunk's later codecs see a different
+    shape, so their cached forms must be keyed on what they see."""
+    data = np.arange(6, dtype="float32")
+    case = {
+        "codecs": [{"name": "crop", "configuration": {"shape": [{"parameter": 0}]}}, *GZIP],
+        "parameters": ["int64"],
+    }
+    store = MemoryStore()
+    put(store, "zarr.json", array_doc([6], regular([3]), [switch(case)]))
+    put(store, "c/0", header(case, (4,)) + encoded_chunk(GZIP, data[0:3], stored=(4,)))
+    put(store, "c/1", header(case, (5,)) + encoded_chunk(GZIP, data[3:6], stored=(5,)))
+    np.testing.assert_array_equal(zarr.open_array(store, mode="r")[...], data)
