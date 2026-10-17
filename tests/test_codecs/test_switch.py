@@ -258,9 +258,38 @@ def test_cached_chain_equals_a_fresh_parse_and_evolve() -> None:
         config=ArrayConfig.from_dict({}),
         prototype=default_buffer_prototype(),
     )
-    for values in [(280.0, 100.0), (270.0, 50.0), (280.0, 100.0)]:
+    for values in [(280.0, 100.0), (270.0, 50.0), (280.0, 100.0), (float("nan"), 2.0)]:
         want = evolve_codecs(parse_codecs(_fill(codecs, values)), spec)
         assert _chain(json.dumps(codecs), values, spec) == want
+
+    # one literal argument and one open one
+    mixed = [
+        {"name": "scale_offset", "configuration": {"offset": 5, "scale": {"parameter": 0}}},
+        *GZIP,
+    ]
+    for one in [(2.0,), (0.5,)]:
+        want = evolve_codecs(parse_codecs(_fill(mixed, one)), spec)
+        assert _chain(json.dumps(mixed), one, spec) == want
+
+
+def test_scale_offset_takes_the_field_update_and_others_reparse() -> None:
+    from zarr.codecs.scale_offset import ScaleOffset
+    from zarr.codecs.switch import _case_codecs, _Open
+
+    so = {"name": "scale_offset", "configuration": {"offset": {"parameter": 0}, "scale": 4}}
+    crop = {"name": "crop", "configuration": {"shape": [{"parameter": 0}]}}
+    nested = {"name": "scale_offset", "configuration": {"offset": [{"parameter": 0}]}}
+    built = _case_codecs(json.dumps([so, crop, nested, *GZIP]))
+    assert isinstance(built[0], _Open)
+    assert built[0].cls is ScaleOffset
+    assert built[0].fixed == (("scale", 4),)
+    assert built[0].slots == (("offset", 0),)
+    assert isinstance(built[1], _Open)
+    assert built[1].cls is None  # not a plain-argument codec
+    assert isinstance(built[2], _Open)
+    assert built[2].cls is None  # not a whole argument
+    assert built[0].build((3.0,)) == ScaleOffset(offset=3.0, scale=4)
+    assert built[0].build((float("nan"),)) == ScaleOffset(offset="NaN", scale=4)
 
 
 def test_a_parameter_that_changes_downstream_specs() -> None:

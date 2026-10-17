@@ -94,15 +94,77 @@ def _has_slots(node: Any) -> bool:
     return False
 
 
+def _plain_argument_codecs() -> dict[str, type]:
+    """Codecs that store each configuration value exactly as given, so a chunk's values
+    can go straight to the constructor in place of a re-parse.
+
+    Opt-in by class: a codec whose constructor normalizes its arguments would need its
+    own rule. Others take the general path.
+    """
+    from zarr.codecs.scale_offset import ScaleOffset
+
+    return {"scale_offset": ScaleOffset}
+
+
+@dataclass(frozen=True)
+class _Open:
+    """A codec with open values, built per chunk.
+
+    With `cls`, its open values are top-level arguments of a plain-argument codec: the
+    chunk's values become constructor arguments directly. Otherwise the codec's JSON is
+    filled in and parsed.
+    """
+
+    text: str
+    cls: type | None = None
+    fixed: tuple[tuple[str, Any], ...] = ()  # its literal arguments
+    slots: tuple[tuple[str, int], ...] = ()  # argument name, parameter index
+
+    def build(self, values: tuple[float | int, ...]) -> Codec:
+        if self.cls is None:
+            from zarr.core.metadata.v3 import parse_codecs
+
+            (codec,) = parse_codecs([_fill(json.loads(self.text), values)])
+            return codec
+        arguments = dict(self.fixed)
+        for name, k in self.slots:
+            arguments[name] = _json_number(values[k])
+        return self.cls(**arguments)  # type: ignore[no-any-return]
+
+
+def _open(node: dict[str, Any]) -> _Open:
+    from zarr.registry import get_codec_class
+
+    text = json.dumps(node)
+    cls = _plain_argument_codecs().get(node.get("name", ""))
+    configuration = node.get("configuration", {})
+    # the field update only for the implementation the registry would pick, and only
+    # when every open value is a whole argument
+    if (
+        cls is None
+        or get_codec_class(node["name"]) is not cls
+        or set(node) - {"name", "configuration"}
+    ):
+        return _Open(text)
+    fixed, slots = [], []
+    for name, value in configuration.items():
+        if isinstance(value, dict) and set(value) == {"parameter"}:
+            slots.append((name, value["parameter"]))
+        elif _has_slots(value):
+            return _Open(text)
+        else:
+            fixed.append((name, value))
+    return _Open(text, cls, tuple(fixed), tuple(slots))
+
+
 @lru_cache(maxsize=1024)
-def _case_codecs(codecs: str) -> tuple[Codec | str, ...]:
-    """A case's codecs: each parsed once if it has no open values, else kept as its
-    JSON text, to be parsed per chunk with the chunk's values."""
+def _case_codecs(codecs: str) -> tuple[Codec | _Open, ...]:
+    """A case's codecs: each parsed once if it has no open values, else an `_Open` to
+    build per chunk with the chunk's values."""
     from zarr.core.metadata.v3 import parse_codecs
 
     return tuple(
-        json.dumps(node) if _has_slots(node) else parse_codecs([node])[0]
-        for node in json.loads(codecs)
+        _open(node) if _has_slots(node) else parse_codecs([node])[0] for node in json.loads(codecs)
     )
 
 
@@ -111,7 +173,7 @@ def _evolved(codecs: str, position: int, spec: ArraySpec) -> Codec:
     """A case's codec without open values, evolved for the spec it sees. Keyed on that
     spec, so a parameter that changes what downstream codecs see only misses the cache."""
     codec = _case_codecs(codecs)[position]
-    if isinstance(codec, str):
+    if isinstance(codec, _Open):
         raise TypeError("switch: a codec with open values is built per chunk")
     return codec.evolve_from_array_spec(spec)
 
@@ -121,18 +183,15 @@ def _chain(
 ) -> tuple[Codec, ...]:
     """A case's codecs with the chunk's values, each evolved for the spec it sees.
 
-    Only the codecs with open values are parsed and evolved per chunk; the others come
+    Only the codecs with open values are built and evolved per chunk; the others come
     from the cache. Equivalent to parsing the filled-in chain and running
     `evolve_codecs` on it.
     """
-    from zarr.core.metadata.v3 import parse_codecs
-
     out: list[Codec] = []
     spec = chunk_spec
     for position, codec in enumerate(_case_codecs(codecs)):
-        if isinstance(codec, str):
-            (built,) = parse_codecs([_fill(json.loads(codec), values)])
-            evolved = built.evolve_from_array_spec(spec)
+        if isinstance(codec, _Open):
+            evolved = codec.build(values).evolve_from_array_spec(spec)
         else:
             evolved = _evolved(codecs, position, spec)
         out.append(evolved)
