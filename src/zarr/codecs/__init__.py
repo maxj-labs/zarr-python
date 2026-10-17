@@ -30,6 +30,7 @@ from zarr.codecs.numcodecs import (
 )
 from zarr.codecs.scale_offset import ScaleOffset
 from zarr.codecs.sharding import ShardingCodec, ShardingCodecIndexLocation, SubchunkWriteOrder
+from zarr.codecs.switch import CropCodec, SwitchCodec
 from zarr.codecs.transpose import TransposeCodec
 from zarr.codecs.vlen_utf8 import VLenBytesCodec, VLenUTF8Codec
 from zarr.codecs.zstd import ZstdCodec
@@ -61,9 +62,11 @@ register_codec("bytes", BytesCodec)
 # compatibility with earlier versions of ZEP1
 register_codec("endian", BytesCodec)
 register_codec("crc32c", Crc32cCodec)
+register_codec("crop", CropCodec)  # experimental, see zarr.codecs.switch
 register_codec("gzip", GzipCodec)
 register_codec("scale_offset", ScaleOffset)
 register_codec("sharding_indexed", ShardingCodec)
+register_codec("switch", SwitchCodec)  # experimental, see zarr.codecs.switch
 register_codec("zstd", ZstdCodec)
 register_codec("vlen-utf8", VLenUTF8Codec)
 register_codec("vlen-bytes", VLenBytesCodec)
