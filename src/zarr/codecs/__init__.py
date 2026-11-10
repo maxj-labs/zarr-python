@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from zarr.codecs.array_concat import ArrayConcatCodec, ArrayConcatPiece
 from zarr.codecs.blosc import BloscCname, BloscCodec, BloscShuffle
 from zarr.codecs.bytes import BytesCodec, Endian
 from zarr.codecs.cast_value import CastValue
@@ -36,6 +37,8 @@ from zarr.codecs.zstd import ZstdCodec
 from zarr.registry import register_codec
 
 __all__ = [
+    "ArrayConcatCodec",
+    "ArrayConcatPiece",
     "BloscCname",
     "BloscCodec",
     "BloscShuffle",
@@ -54,6 +57,7 @@ __all__ = [
     "ZstdCodec",
 ]
 
+register_codec("array_concat", ArrayConcatCodec)
 register_codec("blosc", BloscCodec)
 register_codec("cast_value", CastValue)
 register_codec("bytes", BytesCodec)

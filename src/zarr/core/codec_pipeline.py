@@ -962,8 +962,13 @@ def codecs_from_list_unchecked(
 
     if array_bytes_maybe is None:
         raise ValueError("Required ArrayBytesCodec was not found.")
-    else:
-        return array_array, array_bytes_maybe, bytes_bytes
+    from zarr.codecs.array_concat import ArrayConcatCodec
+
+    if isinstance(array_bytes_maybe, ArrayConcatCodec) and (array_array or bytes_bytes):
+        # Another codec would turn off partial decoding, and with it the only
+        # way this codec reads: the array would read as its fill value.
+        raise ValueError("The `array_concat` codec must be an array's only codec.")
+    return array_array, array_bytes_maybe, bytes_bytes
 
 
 register_pipeline(BatchedCodecPipeline)
