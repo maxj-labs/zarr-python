@@ -41,9 +41,8 @@ __all__ = ["ArrayConcatCodec", "ArrayConcatPiece"]
 
 CODEC_NAME: Final = "array_concat"
 
-# The key of the only chunk of an array whose chunk spans the whole array, in
-# the `default` and `v2` chunk key encodings, with either separator.
-_ONLY_CHUNK_KEY: Final = re.compile(r"(?:^|/)(?:c(?:[/.]0)+|0(?:[/.]0)*)$")
+# A chunk's key, in the `default` and `v2` chunk key encodings with either separator.
+_CHUNK_KEY: Final = re.compile(r"(?:^|/)(?:c(?:[/.]\d+)+|\d+(?:[/.]\d+)*)$")
 
 
 def _is_count(value: object) -> bool:
@@ -85,9 +84,28 @@ class ArrayConcatPiece:
         return {"path": self.path, "size": self.size}
 
 
+def _shift(
+    selection: tuple[Any, ...], origin: tuple[int, ...], chunk_shape: tuple[int, ...]
+) -> tuple[Any, ...]:
+    """A selection of a chunk, as a selection of the array the chunk starts at `origin` in."""
+    out: list[Any] = []
+    for sel, start, length in zip(selection, origin, chunk_shape, strict=True):
+        if isinstance(sel, slice):
+            lo, hi, step = sel.indices(length)
+            out.append(slice(lo + start, hi + start, step))
+        elif np.ndim(sel) == 0:
+            out.append(int(sel) + start)
+        else:
+            arr = np.asarray(sel)
+            if arr.dtype == bool:
+                arr = np.nonzero(arr)[0]
+            out.append(arr + start)
+    return tuple(out)
+
+
 def _array_path(chunk_key: str) -> str:
-    """The path of the array node, from the key of its only chunk."""
-    path, n = _ONLY_CHUNK_KEY.subn("", chunk_key)
+    """The path of the array node, from the key of one of its chunks."""
+    path, n = _CHUNK_KEY.subn("", chunk_key)
     if n != 1:
         raise ValueError(
             f"Cannot tell the array's path from the chunk key {chunk_key!r}. The "
@@ -140,9 +158,11 @@ def _bounding_box(
 class ArrayConcatCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     """Read other arrays of the same store, joined along one axis, as one array.
 
-    The array that uses this codec MUST have a regular chunk grid whose chunk
-    shape is the array's shape, and MUST NOT have other codecs. It stores no
-    chunks. It is read-only: its contents change when its pieces do.
+    The array that uses this codec MUST have a regular chunk grid and MUST NOT
+    have other codecs. It stores no chunks, so its chunk shape is only what it
+    reports to readers: any shape works, and one that lines up with the pieces'
+    own chunks lets a reader that works chunk by chunk read each stored chunk
+    once. It is read-only: its contents change when its pieces do.
 
     Parameters
     ----------
@@ -154,6 +174,7 @@ class ArrayConcatCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     """
 
     is_fixed_size = False
+    needs_chunk_coords = True
 
     axis: int
     pieces: tuple[ArrayConcatPiece, ...]
@@ -192,12 +213,10 @@ class ArrayConcatCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     ) -> None:
         if self.axis >= len(shape):
             raise ValueError(f"axis {self.axis} is out of bounds for an array of shape {shape}.")
-        if not isinstance(chunk_grid, RegularChunkGridMetadata) or (
-            tuple(chunk_grid.chunk_shape) != tuple(shape)
-        ):
+        if not isinstance(chunk_grid, RegularChunkGridMetadata):
             raise ValueError(
-                f"An array with the {CODEC_NAME!r} codec has one chunk, of the array's shape "
-                f"({shape}). Got the chunk grid {chunk_grid!r}."
+                f"An array with the {CODEC_NAME!r} codec has a regular chunk grid. "
+                f"Got {chunk_grid!r}."
             )
         total = sum(p.size for p in self.pieces)
         if total != shape[self.axis]:
@@ -231,8 +250,20 @@ class ArrayConcatCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                 f"The {CODEC_NAME!r} codec reads its pieces from the array's store, so it "
                 f"cannot be nested in another codec. Got {type(byte_getter)!r}."
             )
-        shape = chunk_spec.shape
+        # Where the requested chunk starts in the array. Chunks of a regular grid
+        # all have the grid's shape, so the origin follows from the coordinates.
+        coords = chunk_spec.chunk_coords or (0,) * len(chunk_spec.shape)
+        origin = tuple(int(c) * int(n) for c, n in zip(coords, chunk_spec.shape, strict=True))
         array_path = _array_path(byte_getter.path)
+        selection = _shift(
+            selection if isinstance(selection, tuple) else (selection,), origin, chunk_spec.shape
+        )
+        # An extent that holds the selection: the pieces' total along the axis, and
+        # up to the end of this chunk elsewhere.
+        shape = tuple(
+            sum(p.size for p in self.pieces) if d == self.axis else int(o + n)
+            for d, (o, n) in enumerate(zip(origin, chunk_spec.shape, strict=True))
+        )
 
         # The pieces tile the array along `axis`, so a chunk grid over them
         # splits any selection of the array into selections of pieces.
@@ -249,12 +280,12 @@ class ArrayConcatCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         async def read_piece(index: int, piece_selection: SelectorTuple) -> NDBuffer:
             piece = self.pieces[index]
             path = _resolve(array_path, piece.path)
-            piece_shape = (*shape[: self.axis], piece.size, *shape[self.axis + 1 :])
             array = await AsyncArray.open(StorePath(byte_getter.store, path), zarr_format=3)
-            if array.shape != piece_shape:
+            piece_shape = array.shape
+            if len(piece_shape) != len(shape) or piece_shape[self.axis] != piece.size:
                 raise ValueError(
                     f"The piece at {path!r} has shape {array.shape}, but the array that "
-                    f"joins it expects {piece_shape}."
+                    f"joins it expects length {piece.size} along axis {self.axis}."
                 )
             if array.dtype != native_dtype:
                 raise ValueError(

@@ -167,7 +167,6 @@ def test_read_only(mixed: tuple[zarr.Array[Any], np.ndarray[Any, Any]]) -> None:
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"chunks": (2, 3)}, "one chunk"),
         ({"pieces": [{"path": "../p0", "size": 3}]}, "add up to 3"),
         ({"axis": 2}, "out of bounds"),
         ({"compressors": GzipCodec()}, "only codec"),
@@ -205,7 +204,52 @@ def test_piece_mismatch_and_escape() -> None:
             filters=None,
         )
 
-    with pytest.raises(ValueError, match="has shape"):
-        joined("bad_shape", "../p0")[:]
+    with pytest.raises(ValueError, match="expects length"):
+        zarr.create_array(
+            store,
+            name="bad_length",
+            shape=(3, 5),
+            chunks=(3, 5),
+            dtype="int16",
+            serializer=ArrayConcatCodec(axis=0, pieces=[{"path": "../p0", "size": 3}]),
+            compressors=None,
+            filters=None,
+        )[:]
     with pytest.raises(ValueError, match="leaves the store"):
         joined("escapes", "../../p0")[:]
+
+
+@pytest.mark.parametrize("chunks", [(4, 5, 3), (21, 12, 10), (1, 12, 10), (6, 7, 4)])
+def test_reported_chunk_shape_is_free(chunks: tuple[int, ...]) -> None:
+    """The array stores no chunks, so it may report any chunk shape; reads agree."""
+    rng = np.random.default_rng(3)
+    store = MemoryStore()
+    pieces = [rng.integers(0, 99, size=(n, 12, 10)).astype("int32") for n in (7, 5, 9)]
+    specs = []
+    for i, (data, c) in enumerate(zip(pieces, [(1, 12, 10), (2, 5, 5), (4, 3, 7)], strict=True)):
+        zarr.create_array(store, name=f"p{i}", data=data, chunks=c)
+        specs.append({"path": f"../p{i}", "size": data.shape[0]})
+    expected = np.concatenate(pieces)
+    arr = zarr.create_array(
+        store,
+        name="joined",
+        shape=expected.shape,
+        chunks=chunks,
+        dtype="int32",
+        serializer=ArrayConcatCodec(axis=0, pieces=specs),
+        compressors=None,
+        filters=None,
+    )
+    assert arr.chunks == chunks
+    np.testing.assert_array_equal(arr[:], expected)
+    np.testing.assert_array_equal(arr[3:19, 2:11, 1:9:2], expected[3:19, 2:11, 1:9:2])
+    oindex: Any = arr.oindex
+    np.testing.assert_array_equal(
+        oindex[[0, 6, 7, 12, 20], [1, 11], [0, 4, 9]],
+        expected[np.ix_([0, 6, 7, 12, 20], [1, 11], [0, 4, 9])],
+    )
+    np.testing.assert_array_equal(
+        arr.vindex[[20, 0, 7, 12], [0, 11, 5, 3], [9, 0, 2, 7]],
+        expected[[20, 0, 7, 12], [0, 11, 5, 3], [9, 0, 2, 7]],
+    )
+    np.testing.assert_array_equal(arr.vindex[expected > 90], expected[expected > 90])
