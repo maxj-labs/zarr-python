@@ -1,10 +1,18 @@
-"""An array-to-bytes codec that encodes runs of chunks in different ways.
+"""An array-to-bytes codec that encodes chunks in different ways.
 
 An array made of files written at different times can have chunks that are not
 all encoded alike: the compression changed, or a file's last chunk is stored
-larger than its place in the grid. This codec holds a short table of *cases*,
-each covering a run of chunks along one axis, and decodes a chunk with the case
-its grid position falls in. Nothing is stored per chunk.
+larger than its place in the grid. This codec holds a short table of *cases*
+and decodes each chunk with one of them. Which one is found in either of two
+ways:
+
+- ``"select": "key"``: the chunk's bytes begin with a short key that names its
+  case. The chunk describes itself, so it can be moved, re-keyed or nested
+  without the codec knowing where it is. The store has to supply the key in
+  front of the chunk (a virtual reference with a literal prefix does).
+- ``"select": "position"``: each case covers a run of chunks along one axis,
+  and the chunk's grid position picks the case. Nothing is stored per chunk,
+  but the codec has to be told which chunk it is decoding.
 """
 
 from __future__ import annotations
@@ -12,17 +20,18 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from zarr.abc.codec import ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin
+from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
 from zarr.core.array_spec import ArraySpec
 from zarr.core.common import JSON, parse_named_configuration
 
 if TYPE_CHECKING:
     from typing import Self
 
-    from zarr.abc.store import ByteGetter
-    from zarr.core.buffer import Buffer, NDBuffer
+    from zarr.abc.store import ByteGetter, ByteRequest
+    from zarr.core.buffer import Buffer, BufferPrototype, NDBuffer
     from zarr.core.indexing import SelectorTuple
 
 __all__ = ["SwitchCodec", "rle_cases"]
@@ -30,6 +39,7 @@ __all__ = ["SwitchCodec", "rle_cases"]
 CODEC_NAME: Final = "switch"
 _CASE_KEYS: Final = {
     "chunks",
+    "key",
     "codecs",
     "encoded_chunk_shape",
     "fill_value",
@@ -57,33 +67,70 @@ def _partial_decoder(codecs_json: str, spec: ArraySpec) -> Any:
     return None
 
 
+class _AfterKey:
+    """A chunk's bytes without the key in front of them.
+
+    A codec that reads byte ranges of the chunk (sharding) sees offsets that
+    start after the key, so its own index stays valid.
+    """
+
+    def __init__(self, byte_getter: ByteGetter, key_bytes: int) -> None:
+        self._byte_getter = byte_getter
+        self._key_bytes = key_bytes
+
+    async def get(
+        self, prototype: BufferPrototype, byte_range: ByteRequest | None = None
+    ) -> Buffer | None:
+        k = self._key_bytes
+        shifted: ByteRequest
+        if byte_range is None:
+            shifted = OffsetByteRequest(k)
+        elif isinstance(byte_range, RangeByteRequest):
+            shifted = RangeByteRequest(byte_range.start + k, byte_range.end + k)
+        elif isinstance(byte_range, OffsetByteRequest):
+            shifted = OffsetByteRequest(byte_range.offset + k)
+        elif isinstance(byte_range, SuffixByteRequest):
+            shifted = byte_range
+        else:
+            raise TypeError(f"Unexpected byte range {byte_range!r}.")
+        return await self._byte_getter.get(prototype, shifted)
+
+
 @dataclass(frozen=True)
 class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
-    """Decode each chunk with the case of the run of chunks it belongs to.
+    """Decode each chunk with one of several cases.
 
     Parameters
     ----------
-    axis : int
-        The axis along which the runs lie.
     cases : sequence of dict
-        The runs, in order along `axis`. Each case has:
+        Each case has:
 
-        - ``chunks``: the number of chunks along `axis` that the run covers;
-        - ``codecs``: the codec chain that decodes them;
+        - ``codecs``: the codec chain of its chunks;
+        - ``key`` (with ``select="key"``): the hex of the bytes that a chunk of
+          this case begins with;
+        - ``chunks`` (with ``select="position"``): the number of chunks along
+          `axis` that the case covers; the cases are then in order along it;
         - ``encoded_chunk_shape`` (optional): the shape a stored chunk decodes
           to, when it is larger than the chunk's place in the grid; the codec
           keeps its leading corner. An entry of ``null`` means "the size of the
           chunk's place".
-        - ``fill_value`` (optional): what a chunk of the run that is not stored
-          reads as, when that is not the array's fill value;
+        - ``fill_value`` (optional): what a chunk of the case that stores
+          nothing reads as, when that is not the array's fill value;
         - ``coalesce_max_gap_bytes`` (optional): for a chain that reads parts of
           a chunk by byte range (sharding), how close two ranges must be to be
           read in one request. 0 reads exactly the ranges asked for.
+    select : {"position", "key"}
+        How a chunk's case is found.
+    axis : int
+        With ``select="position"``, the axis along which the cases lie.
+    key_bytes : int
+        With ``select="key"``, the length of the key in front of every chunk.
 
     Notes
     -----
-    The codec MUST be the array's only codec. Writing a chunk encodes it with its
-    case's chain, padded to the case's stored shape.
+    The codec MUST be the array's only codec. With ``select="position"`` it also
+    encodes: a chunk written through the array gets its case's chain, padded to
+    the case's stored shape. With ``select="key"`` it is read-only.
     """
 
     is_fixed_size = False
@@ -91,28 +138,48 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
 
     axis: int
     cases_json: str
+    select: Literal["position", "key"]
+    key_bytes: int
 
-    def __init__(self, *, axis: int, cases: Any) -> None:
+    def __init__(
+        self,
+        *,
+        cases: Any,
+        axis: int = 0,
+        select: Literal["position", "key"] = "position",
+        key_bytes: int = 8,
+    ) -> None:
         cases = json.loads(cases) if isinstance(cases, str) else [dict(c) for c in cases]
         axis_given: object = axis
         if isinstance(axis_given, bool) or not isinstance(axis_given, int) or axis_given < 0:
             raise TypeError(f"axis must be a non-negative integer. Got {axis!r}.")
+        if select not in ("position", "key"):
+            raise ValueError(f"select must be 'position' or 'key'. Got {select!r}.")
         if not cases:
             raise ValueError("The switch codec needs at least one case.")
+        required = {"codecs", "chunks" if select == "position" else "key"}
+        seen: set[str] = set()
         for case in cases:
-            if not {"chunks", "codecs"} <= set(case) <= _CASE_KEYS:
+            if not required <= set(case) <= _CASE_KEYS:
                 raise ValueError(
-                    f"A case has 'chunks' and 'codecs', and optionally "
-                    f"{sorted(_CASE_KEYS - {'chunks', 'codecs'})}. Got {sorted(case)}."
+                    f"With select={select!r} a case has {sorted(required)}, and optionally "
+                    f"{sorted(_CASE_KEYS - required)}. Got {sorted(case)}."
                 )
-            if (
-                isinstance(case["chunks"], bool)
-                or not isinstance(case["chunks"], int)
-                or case["chunks"] < 1
-            ):
-                raise ValueError(f"A case covers at least one chunk. Got {case['chunks']!r}.")
+            if select == "position":
+                n = case["chunks"]
+                if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                    raise ValueError(f"A case covers at least one chunk. Got {n!r}.")
+            else:
+                key = case["key"]
+                if not isinstance(key, str) or len(bytes.fromhex(key)) != key_bytes:
+                    raise ValueError(f"A case's key is {key_bytes} bytes of hex. Got {key!r}.")
+                if key in seen:
+                    raise ValueError(f"Two cases have the key {key!r}.")
+                seen.add(key)
         object.__setattr__(self, "axis", axis)
         object.__setattr__(self, "cases_json", json.dumps(cases, sort_keys=True))
+        object.__setattr__(self, "select", select)
+        object.__setattr__(self, "key_bytes", key_bytes)
 
     @property
     def cases(self) -> list[dict[str, Any]]:
@@ -122,15 +189,27 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     @classmethod
     def from_dict(cls, data: dict[str, JSON]) -> Self:
         _, configuration = parse_named_configuration(data, CODEC_NAME)
-        return cls(axis=configuration["axis"], cases=configuration["cases"])  # type: ignore[arg-type]
+        return cls(
+            cases=configuration["cases"],
+            axis=configuration.get("axis", 0),  # type: ignore[arg-type]
+            select=configuration.get("select", "position"),  # type: ignore[arg-type]
+            key_bytes=configuration.get("key_bytes", 8),  # type: ignore[arg-type]
+        )
 
     def to_dict(self) -> dict[str, JSON]:
-        return {"name": CODEC_NAME, "configuration": {"axis": self.axis, "cases": self.cases}}
+        configuration: dict[str, JSON]
+        if self.select == "key":
+            configuration = {"select": "key", "key_bytes": self.key_bytes, "cases": self.cases}
+        else:
+            configuration = {"axis": self.axis, "cases": self.cases}
+        return {"name": CODEC_NAME, "configuration": configuration}
 
     def compute_encoded_size(self, input_byte_length: int, chunk_spec: ArraySpec) -> int:
         raise NotImplementedError
 
-    def _case(self, index: int) -> dict[str, Any]:
+    # --- finding a chunk's case
+
+    def _case_at(self, index: int) -> dict[str, Any]:
         start = 0
         for case in self.cases:
             start += case["chunks"]
@@ -138,23 +217,29 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                 return case
         raise IndexError(f"Chunk {index} along axis {self.axis} lies beyond the last case.")
 
-    def _index(self, byte_getter: ByteGetter, chunk_spec: ArraySpec) -> int:
+    def _case_named(self, key: bytes) -> dict[str, Any]:
+        for case in self.cases:
+            if case["key"] == key.hex():
+                return case
+        raise ValueError(f"A chunk names the case {key.hex()!r}, which the array does not list.")
+
+    def _position(self, chunk_spec: ArraySpec, byte_getter: ByteGetter | None = None) -> int:
         if chunk_spec.chunk_coords is not None:
             return chunk_spec.chunk_coords[self.axis]
-        # An array that does not pass coordinates (an older reader): read them back
-        # from the chunk's key, in the `default` encoding with the `/` separator.
+        # A reader that does not pass coordinates: read them back from the chunk's
+        # key, in the `default` encoding with the `/` separator.
         key = getattr(byte_getter, "path", None)
         if not isinstance(key, str):
-            raise TypeError("The switch codec cannot tell which chunk it is decoding.")
+            raise NotImplementedError(
+                "The switch codec was not told which chunk this is. It must be the "
+                "array's only codec, in a reader that passes chunk coordinates."
+            )
         return int(key.split("/")[-len(chunk_spec.shape) :][self.axis])
 
-    def _resolve(
-        self, index: int, chunk_spec: ArraySpec
-    ) -> tuple[dict[str, Any], ArraySpec, str, bool]:
-        """The case of a chunk: its dict, the spec its chain works with (the stored
-        shape, the case's fill value), the chain as JSON, and whether the case has a
-        fill value of its own."""
-        case = self._case(index)
+    def _resolve(self, case: dict[str, Any], chunk_spec: ArraySpec) -> tuple[ArraySpec, str, bool]:
+        """What a case means for a chunk: the spec its chain works with (the stored
+        shape, the case's fill value), the chain as JSON, and whether the case has
+        a fill value of its own."""
         encoded_shape = tuple(
             n if e is None else e
             for e, n in zip(
@@ -177,42 +262,50 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             config=config,
             prototype=chunk_spec.prototype,
         )
-        return case, spec, json.dumps(case["codecs"], sort_keys=True), own_fill
+        return spec, json.dumps(case["codecs"], sort_keys=True), own_fill
+
+    # --- decoding
 
     async def _decode_partial_single(
         self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
     ) -> NDBuffer | None:
-        _, spec, codecs_json, own_fill = self._resolve(
-            self._index(byte_getter, chunk_spec), chunk_spec
-        )
+        source: Any = byte_getter
+        if self.select == "key":
+            head = await byte_getter.get(chunk_spec.prototype, RangeByteRequest(0, self.key_bytes))
+            if head is None:
+                return None  # nothing stored: the array's fill value
+            case = self._case_named(head.to_bytes())
+            source = _AfterKey(byte_getter, self.key_bytes)
+        else:
+            case = self._case_at(self._position(chunk_spec, byte_getter))
+        spec, codecs_json, own_fill = self._resolve(case, chunk_spec)
         inner = _partial_decoder(codecs_json, spec)
         if inner is not None:
             # The chunk's place is the leading corner of the stored shape, so the
             # selection means the same thing in both. Missing inner chunks are
             # filled from `spec`.
-            out = await inner._decode_partial_single(byte_getter, selection, spec)
+            out = await inner._decode_partial_single(source, selection, spec)
             if out is None and own_fill:
                 return self._filled(selection, chunk_spec, spec.fill_value)
             return out  # type: ignore[no-any-return]
-        chunk_bytes = await byte_getter.get(prototype=chunk_spec.prototype)
-        if chunk_bytes is None:
-            # None makes the reader use the array's fill value.
+        chunk_bytes = await source.get(prototype=chunk_spec.prototype)
+        if chunk_bytes is None or len(chunk_bytes) == 0:
+            # A key with nothing after it is a chunk that stores nothing but still
+            # names its case. None makes the reader use the array's fill value.
             return self._filled(selection, chunk_spec, spec.fill_value) if own_fill else None
         (decoded,) = await _pipeline(codecs_json, spec).decode([(chunk_bytes, spec)])
         if spec.shape != chunk_spec.shape:
             decoded = decoded[tuple(slice(0, n) for n in chunk_spec.shape)]
         return decoded[selection]  # type: ignore[no-any-return]
 
-    def _position(self, chunk_spec: ArraySpec) -> int:
-        if chunk_spec.chunk_coords is None:
-            raise NotImplementedError(
-                "The switch codec was not told which chunk this is. It must be the "
-                "array's only codec, in a reader that passes chunk coordinates."
-            )
-        return chunk_spec.chunk_coords[self.axis]
-
     async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
-        _, spec, codecs_json, _ = self._resolve(self._position(chunk_spec), chunk_spec)
+        if self.select == "key":
+            raw = chunk_bytes.to_bytes()
+            case = self._case_named(raw[: self.key_bytes])
+            chunk_bytes = chunk_spec.prototype.buffer.from_bytes(raw[self.key_bytes :])
+        else:
+            case = self._case_at(self._position(chunk_spec))
+        spec, codecs_json, _ = self._resolve(case, chunk_spec)
         (decoded,) = await _pipeline(codecs_json, spec).decode([(chunk_bytes, spec)])
         if spec.shape != chunk_spec.shape:
             decoded = decoded[tuple(slice(0, n) for n in chunk_spec.shape)]
@@ -220,7 +313,12 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
 
     async def _encode_single(self, chunk_array: NDBuffer, chunk_spec: ArraySpec) -> Buffer | None:
         """Encode a chunk with its case's chain, padded to the case's stored shape."""
-        _, spec, codecs_json, _ = self._resolve(self._position(chunk_spec), chunk_spec)
+        if self.select == "key":
+            raise NotImplementedError(
+                "With select='key' the switch codec is read-only: nothing says which "
+                "case a new chunk belongs to."
+            )
+        spec, codecs_json, _ = self._resolve(self._case_at(self._position(chunk_spec)), chunk_spec)
         if spec.shape != chunk_spec.shape:
             padded = chunk_spec.prototype.nd_buffer.create(
                 shape=spec.shape,

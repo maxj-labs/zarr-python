@@ -244,3 +244,100 @@ def test_writes_encode_each_chunk_with_its_case() -> None:
 def test_invalid_cases(cases: list[dict[str, Any]]) -> None:
     with pytest.raises(ValueError):
         SwitchCodec(axis=0, cases=cases)
+
+
+class _Prefixing(zarr.storage.WrapperStore[MemoryStore]):
+    """Stands in for a store whose references carry a literal prefix: every chunk of
+    `path` is served with its key in front, and byte ranges count from the key."""
+
+    def __init__(
+        self, store: MemoryStore, path: str = "", keys: dict[int, bytes] | None = None
+    ) -> None:
+        super().__init__(store)
+        self._path, self._keys = path, keys or {}
+
+    def _with_store(self, store: MemoryStore) -> _Prefixing:
+        return type(self)(store, self._path, self._keys)
+
+    async def get(self, key: str, prototype: Any, byte_range: Any = None) -> Any:
+        marker = f"{self._path}/c/"
+        if not key.startswith(marker):
+            return await self._store.get(key, prototype, byte_range)
+        whole = await self._store.get(key, prototype)
+        if whole is None:
+            return None
+        data = self._keys[int(key[len(marker) :].split("/")[0])] + whole.to_bytes()
+        if byte_range is None:
+            return prototype.buffer.from_bytes(data)
+        if hasattr(byte_range, "start"):
+            return prototype.buffer.from_bytes(data[byte_range.start : byte_range.end])
+        if hasattr(byte_range, "offset"):
+            return prototype.buffer.from_bytes(data[byte_range.offset :])
+        return prototype.buffer.from_bytes(data[-byte_range.suffix :])
+
+
+def test_select_by_key() -> None:
+    """A chunk that begins with its case's key decodes wherever it is put, also when
+    its chain is a sharding codec that reads byte ranges."""
+    rng = np.random.default_rng(3)
+    store = MemoryStore()
+    a = zarr.create_array(
+        store,
+        name="a",
+        data=rng.integers(0, 99, (4, 6, 4)).astype("int32"),
+        chunks=(2, 6, 4),
+        compressors=GzipCodec(),
+    )
+    b = zarr.create_array(
+        store,
+        name="b",
+        data=rng.integers(0, 99, (4, 6, 4)).astype("int32"),
+        shards=(2, 6, 4),
+        chunks=(1, 3, 2),
+        compressors=ZstdCodec(),
+    )
+    key_a, key_b = b"\x0a" * 4, b"\x0b" * 4
+    cases = [
+        {"key": key_b.hex(), "codecs": _codec_dicts(b), "coalesce_max_gap_bytes": 0},
+        {"key": key_a.hex(), "codecs": _codec_dicts(a)},
+    ]
+    j = zarr.create_array(
+        store,
+        name="j",
+        shape=(8, 6, 4),
+        chunks=(2, 6, 4),
+        dtype="int32",
+        serializer=SwitchCodec(select="key", key_bytes=4, cases=cases),
+        compressors=None,
+        filters=None,
+    )
+    assert j.metadata.to_dict()["codecs"][0]["configuration"]["select"] == "key"  # type: ignore[index,call-overload]
+    # interleave the two sources: a, b, b, a. No run-length table could say that in two cases.
+    order = [("a", 0), ("b", 0), ("b", 1), ("a", 1)]
+    proto = default_buffer_prototype()
+    for position, (src, i) in enumerate(order):
+        buf = sync(store.get(f"{src}/c/{i}/0/0", proto))
+        assert buf is not None
+        sync(store.set(f"j/c/{position}/0/0", buf))
+    keys = {position: (key_a if src == "a" else key_b) for position, (src, _) in enumerate(order)}
+    joined = zarr.open_array(_Prefixing(store, "j", keys), path="j", mode="r")
+    expected = np.concatenate([a[0:2], b[0:2], b[2:4], a[2:4]])
+    np.testing.assert_array_equal(joined[:], expected)
+    np.testing.assert_array_equal(joined[1:7, 2:5, 1:3], expected[1:7, 2:5, 1:3])
+    np.testing.assert_array_equal(joined[3, 4, 3], expected[3, 4, 3])
+    with pytest.raises(NotImplementedError, match="read-only"):
+        zarr.open_array(_Prefixing(store, "j", keys), path="j", mode="r+")[0] = 1
+
+
+def test_key_cases_are_validated() -> None:
+    codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    with pytest.raises(ValueError, match="2 bytes of hex"):
+        SwitchCodec(select="key", key_bytes=2, cases=[{"key": "00", "codecs": codecs}])
+    with pytest.raises(ValueError, match="Two cases"):
+        SwitchCodec(
+            select="key",
+            key_bytes=1,
+            cases=[{"key": "00", "codecs": codecs}, {"key": "00", "codecs": codecs}],
+        )
+    with pytest.raises(ValueError, match="select='key'"):
+        SwitchCodec(select="key", cases=[{"chunks": 1, "codecs": codecs}])
