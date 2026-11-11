@@ -391,6 +391,13 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             case = self._case_at(self._position(chunk_spec, byte_getter))
         spec, codecs_json, own_fill = self._resolve(case, chunk_spec)
         inner = _partial_decoder(codecs_json, spec)
+        if inner is not None and own_fill and self.select == "key":
+            from zarr.codecs.sharding import ShardingCodec
+
+            if not isinstance(inner, ShardingCodec):
+                # The chunk may be its key alone. A shard says so in its index; any
+                # other chain is read whole, where an empty chunk shows as one.
+                inner = None
         if inner is not None:
             # The chunk's place is the leading corner of the stored shape, so the
             # selection means the same thing in both. Missing inner chunks are
@@ -399,7 +406,17 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             if out is None and own_fill:
                 return self._filled(selection, chunk_spec, spec.fill_value)
             return out  # type: ignore[no-any-return]
-        chunk_bytes = await source.get(prototype=chunk_spec.prototype)
+        if source is byte_getter:
+            chunk_bytes = await source.get(prototype=chunk_spec.prototype)
+        else:
+            # Read the chunk with its key and drop the key here: asking a store for
+            # "everything after the key" fails where the chunk is the key alone.
+            whole = await byte_getter.get(prototype=chunk_spec.prototype)
+            chunk_bytes = (
+                None
+                if whole is None
+                else chunk_spec.prototype.buffer.from_bytes(whole.to_bytes()[self.key_bytes :])
+            )
         if chunk_bytes is None or len(chunk_bytes) == 0:
             # A key with nothing after it is a chunk that stores nothing but still
             # names its case. None makes the reader use the array's fill value.
@@ -413,6 +430,12 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         if self.select == "key":
             raw = chunk_bytes.to_bytes()
             case = self._case_named(raw[: self.key_bytes])
+            if len(raw) == self.key_bytes:
+                # A key and nothing else: the chunk stores no data and reads as its
+                # case's fill value.
+                spec, _, _ = self._resolve(case, chunk_spec)
+                whole = tuple(slice(0, n) for n in chunk_spec.shape)
+                return self._filled(whole, chunk_spec, spec.fill_value)
             chunk_bytes = chunk_spec.prototype.buffer.from_bytes(raw[self.key_bytes :])
         else:
             case = self._case_at(self._position(chunk_spec))

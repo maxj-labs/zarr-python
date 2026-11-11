@@ -345,3 +345,33 @@ def test_key_cases_are_validated() -> None:
         )
     with pytest.raises(ValueError, match="select='key'"):
         SwitchCodec(select="key", cases=[{"chunks": 1, "codecs": codecs}])
+
+
+def test_a_key_alone_reads_as_the_cases_fill_value() -> None:
+    """A chunk that is its case's key and nothing more stores no data: it reads as the
+    case's fill value, which may differ from the array's."""
+    store = MemoryStore()
+    codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    cases = [
+        {"key": "0a", "codecs": codecs, "fill_value": -9999.0},
+        {"key": "0b", "codecs": codecs},
+    ]
+    zarr.create_array(
+        store,
+        name="a",
+        shape=(6, 4),
+        chunks=(2, 4),
+        dtype="float32",
+        fill_value=0,
+        serializer=SwitchCodec(select="key", key_bytes=1, cases=cases),
+        compressors=None,
+        filters=None,
+    )
+    proto = default_buffer_prototype()
+    data = np.arange(8, dtype="<f4").reshape(2, 4)
+    sync(store.set("a/c/0/0", proto.buffer.from_bytes(b"\x0a")))
+    sync(store.set("a/c/1/0", proto.buffer.from_bytes(b"\x0b" + data.tobytes())))
+    array = zarr.open_array(store, path="a", mode="r")
+    expected = np.concatenate([np.full((2, 4), -9999.0), data, np.zeros((2, 4))])
+    np.testing.assert_array_equal(array[:], expected)
+    np.testing.assert_array_equal(array[1:5, 1:3], expected[1:5, 1:3])
