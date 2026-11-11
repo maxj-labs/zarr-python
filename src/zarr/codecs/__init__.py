@@ -31,6 +31,7 @@ from zarr.codecs.numcodecs import (
 )
 from zarr.codecs.scale_offset import ScaleOffset
 from zarr.codecs.sharding import ShardingCodec, ShardingCodecIndexLocation, SubchunkWriteOrder
+from zarr.codecs.switch import SwitchCodec
 from zarr.codecs.transpose import TransposeCodec
 from zarr.codecs.vlen_utf8 import VLenBytesCodec, VLenUTF8Codec
 from zarr.codecs.zstd import ZstdCodec
@@ -51,6 +52,7 @@ __all__ = [
     "ShardingCodec",
     "ShardingCodecIndexLocation",
     "SubchunkWriteOrder",
+    "SwitchCodec",
     "TransposeCodec",
     "VLenBytesCodec",
     "VLenUTF8Codec",
@@ -68,6 +70,7 @@ register_codec("crc32c", Crc32cCodec)
 register_codec("gzip", GzipCodec)
 register_codec("scale_offset", ScaleOffset)
 register_codec("sharding_indexed", ShardingCodec)
+register_codec("switch", SwitchCodec)
 register_codec("zstd", ZstdCodec)
 register_codec("vlen-utf8", VLenUTF8Codec)
 register_codec("vlen-bytes", VLenBytesCodec)

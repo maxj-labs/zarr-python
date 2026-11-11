@@ -5713,13 +5713,24 @@ async def _get_selection(
                 config=_config,
                 prototype=prototype,
             )
+        # A codec that decodes by position is told each chunk's grid coordinates.
+        with_coords = getattr(
+            getattr(codec_pipeline, "array_bytes_codec", None), "needs_chunk_coords", False
+        )
+
+        def spec_for(chunk_coords: tuple[int, ...]) -> ArraySpec:
+            spec = (
+                regular_chunk_spec
+                if regular_grid
+                else _get_chunk_spec(metadata, chunk_grid, chunk_coords, _config, prototype)
+            )
+            return replace(spec, chunk_coords=tuple(chunk_coords)) if with_coords else spec
+
         results = await codec_pipeline.read(
             [
                 (
                     store_path / metadata.encode_chunk_key(chunk_coords),
-                    regular_chunk_spec
-                    if regular_grid
-                    else _get_chunk_spec(metadata, chunk_grid, chunk_coords, _config, prototype),
+                    spec_for(chunk_coords),
                     chunk_selection,
                     out_selection,
                     is_complete_chunk,

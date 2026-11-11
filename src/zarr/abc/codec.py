@@ -243,6 +243,11 @@ Codec = ArrayArrayCodec | ArrayBytesCodec | BytesBytesCodec
 class ArrayBytesCodecPartialDecodeMixin:
     """Mixin for array-to-bytes codecs that implement partial decoding."""
 
+    needs_chunk_coords: bool = False
+    """Set to True on a codec that decodes a chunk differently depending on where it is
+    in the chunk grid. The array then passes each chunk's grid coordinates as
+    ``chunk_spec.chunk_coords``."""
+
     async def _decode_partial_single(
         self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
     ) -> NDBuffer | None:

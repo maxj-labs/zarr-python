@@ -148,6 +148,10 @@ class ArraySpec:
     fill_value: Any
     config: ArrayConfig
     prototype: BufferPrototype
+    chunk_coords: tuple[int, ...] | None
+    """The chunk's position in the array's chunk grid, when the array-to-bytes codec asks
+    for it (``needs_chunk_coords``); otherwise ``None``. It is context for the codec, not
+    part of the spec's identity: two specs that differ only in it compare equal."""
 
     def __init__(
         self,
@@ -156,6 +160,7 @@ class ArraySpec:
         fill_value: Any,
         config: ArrayConfig,
         prototype: BufferPrototype,
+        chunk_coords: tuple[int, ...] | None = None,
     ) -> None:
         shape_parsed = parse_shapelike(shape)
         fill_value_parsed = parse_fill_value(fill_value)
@@ -165,6 +170,9 @@ class ArraySpec:
         object.__setattr__(self, "fill_value", fill_value_parsed)
         object.__setattr__(self, "config", config)
         object.__setattr__(self, "prototype", prototype)
+        object.__setattr__(
+            self, "chunk_coords", None if chunk_coords is None else tuple(chunk_coords)
+        )
 
     def _key(self) -> tuple[object, ...]:
         """Returns the tuple used for equality/hash identity."""
