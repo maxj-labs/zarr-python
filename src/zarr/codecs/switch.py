@@ -27,6 +27,7 @@ from zarr.abc.codec import ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin
 from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
 from zarr.core.array_spec import ArraySpec
 from zarr.core.common import JSON, parse_named_configuration
+from zarr.storage._wrapper import WrapperStore
 
 if TYPE_CHECKING:
     from typing import Self
@@ -104,6 +105,19 @@ def _partial_decoder(codecs_json: str, spec: ArraySpec) -> Any:
     return None
 
 
+def _shift(byte_range: ByteRequest | None, k: int) -> ByteRequest:
+    """The same range of a chunk, counted from before its `k`-byte key."""
+    if byte_range is None:
+        return OffsetByteRequest(k)
+    if isinstance(byte_range, RangeByteRequest):
+        return RangeByteRequest(byte_range.start + k, byte_range.end + k)
+    if isinstance(byte_range, OffsetByteRequest):
+        return OffsetByteRequest(byte_range.offset + k)
+    if isinstance(byte_range, SuffixByteRequest):
+        return byte_range
+    raise TypeError(f"Unexpected byte range {byte_range!r}.")
+
+
 class _AfterKey:
     """A chunk's bytes without the key in front of them.
 
@@ -118,19 +132,60 @@ class _AfterKey:
     async def get(
         self, prototype: BufferPrototype, byte_range: ByteRequest | None = None
     ) -> Buffer | None:
-        k = self._key_bytes
-        shifted: ByteRequest
-        if byte_range is None:
-            shifted = OffsetByteRequest(k)
-        elif isinstance(byte_range, RangeByteRequest):
-            shifted = RangeByteRequest(byte_range.start + k, byte_range.end + k)
-        elif isinstance(byte_range, OffsetByteRequest):
-            shifted = OffsetByteRequest(byte_range.offset + k)
-        elif isinstance(byte_range, SuffixByteRequest):
-            shifted = byte_range
-        else:
-            raise TypeError(f"Unexpected byte range {byte_range!r}.")
-        return await self._byte_getter.get(prototype, shifted)
+        return await self._byte_getter.get(prototype, _shift(byte_range, self._key_bytes))
+
+
+class _AfterKeyStore(WrapperStore[Any]):
+    """A store whose values are read from after a key in front of each of them.
+
+    Sharding fetches many ranges at once, and merges them, only from a store. This
+    keeps that path: the ranges are shifted and handed to the store underneath.
+    """
+
+    def __init__(self, store: Any, key_bytes: int) -> None:
+        super().__init__(store)
+        self._key_bytes = key_bytes
+
+    def _with_store(self, store: Any) -> Self:
+        return type(self)(store, self._key_bytes)
+
+    async def get(
+        self, key: str, prototype: BufferPrototype, byte_range: ByteRequest | None = None
+    ) -> Buffer | None:
+        out: Buffer | None = await self._store.get(
+            key, prototype, _shift(byte_range, self._key_bytes)
+        )
+        return out
+
+    def get_sync(
+        self,
+        key: str,
+        *,
+        prototype: BufferPrototype | None = None,
+        byte_range: ByteRequest | None = None,
+    ) -> Buffer | None:
+        return super().get_sync(
+            key, prototype=prototype, byte_range=_shift(byte_range, self._key_bytes)
+        )
+
+    async def get_partial_values(self, prototype: BufferPrototype, key_ranges: Any) -> Any:
+        shifted = [(key, _shift(r, self._key_bytes)) for key, r in key_ranges]
+        return await self._store.get_partial_values(prototype, shifted)
+
+    async def get_ranges(
+        self, key: str, byte_ranges: Any, *, prototype: BufferPrototype, **kwargs: Any
+    ) -> Any:
+        shifted = [_shift(r, self._key_bytes) for r in byte_ranges]
+        async for group in self._store.get_ranges(key, shifted, prototype=prototype, **kwargs):
+            yield group
+
+
+def _after_key(byte_getter: ByteGetter, key_bytes: int) -> Any:
+    from zarr.storage._common import StorePath
+
+    if isinstance(byte_getter, StorePath):
+        return StorePath(_AfterKeyStore(byte_getter.store, key_bytes), byte_getter.path)
+    return _AfterKey(byte_getter, key_bytes)
 
 
 @dataclass(frozen=True)
@@ -331,7 +386,7 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             if head is None:
                 return None  # nothing stored: the array's fill value
             case = self._case_named(head.to_bytes())
-            source = _AfterKey(byte_getter, self.key_bytes)
+            source = _after_key(byte_getter, self.key_bytes)
         else:
             case = self._case_at(self._position(chunk_spec, byte_getter))
         spec, codecs_json, own_fill = self._resolve(case, chunk_spec)

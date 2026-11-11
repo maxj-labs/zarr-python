@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import zarr
+import zarr.abc.store
 from zarr.codecs import BytesCodec, GzipCodec, ShardingCodec, SwitchCodec, ZstdCodec
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
@@ -258,6 +259,9 @@ class _Prefixing(zarr.storage.WrapperStore[MemoryStore]):
 
     def _with_store(self, store: MemoryStore) -> _Prefixing:
         return type(self)(store, self._path, self._keys)
+
+    # many ranges at once go through `get` below, not straight to the wrapped store
+    get_ranges = zarr.abc.store.Store.get_ranges  # type: ignore[assignment]
 
     async def get(self, key: str, prototype: Any, byte_range: Any = None) -> Any:
         marker = f"{self._path}/c/"
