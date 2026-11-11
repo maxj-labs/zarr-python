@@ -1,4 +1,4 @@
-"""A read-only array-to-bytes codec that decodes runs of chunks in different ways.
+"""An array-to-bytes codec that encodes runs of chunks in different ways.
 
 An array made of files written at different times can have chunks that are not
 all encoded alike: the compression changed, or a file's last chunk is stored
@@ -82,7 +82,8 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
 
     Notes
     -----
-    The codec MUST be the array's only codec, and is read-only.
+    The codec MUST be the array's only codec. Writing a chunk encodes it with its
+    case's chain, padded to the case's stored shape.
     """
 
     is_fixed_size = False
@@ -147,10 +148,13 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             raise TypeError("The switch codec cannot tell which chunk it is decoding.")
         return int(key.split("/")[-len(chunk_spec.shape) :][self.axis])
 
-    async def _decode_partial_single(
-        self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
-    ) -> NDBuffer | None:
-        case = self._case(self._index(byte_getter, chunk_spec))
+    def _resolve(
+        self, index: int, chunk_spec: ArraySpec
+    ) -> tuple[dict[str, Any], ArraySpec, str, bool]:
+        """The case of a chunk: its dict, the spec its chain works with (the stored
+        shape, the case's fill value), the chain as JSON, and whether the case has a
+        fill value of its own."""
+        case = self._case(index)
         encoded_shape = tuple(
             n if e is None else e
             for e, n in zip(
@@ -173,22 +177,61 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             config=config,
             prototype=chunk_spec.prototype,
         )
-        codecs_json = json.dumps(case["codecs"], sort_keys=True)
+        return case, spec, json.dumps(case["codecs"], sort_keys=True), own_fill
+
+    async def _decode_partial_single(
+        self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
+    ) -> NDBuffer | None:
+        _, spec, codecs_json, own_fill = self._resolve(
+            self._index(byte_getter, chunk_spec), chunk_spec
+        )
         inner = _partial_decoder(codecs_json, spec)
         if inner is not None:
             # The chunk's place is the leading corner of the stored shape, so the
             # selection means the same thing in both. Missing inner chunks are
             # filled from `spec`.
             out = await inner._decode_partial_single(byte_getter, selection, spec)
-            return self._filled(selection, chunk_spec, fill) if out is None and own_fill else out
+            if out is None and own_fill:
+                return self._filled(selection, chunk_spec, spec.fill_value)
+            return out  # type: ignore[no-any-return]
         chunk_bytes = await byte_getter.get(prototype=chunk_spec.prototype)
         if chunk_bytes is None:
             # None makes the reader use the array's fill value.
-            return self._filled(selection, chunk_spec, fill) if own_fill else None
+            return self._filled(selection, chunk_spec, spec.fill_value) if own_fill else None
         (decoded,) = await _pipeline(codecs_json, spec).decode([(chunk_bytes, spec)])
-        if encoded_shape != chunk_spec.shape:
+        if spec.shape != chunk_spec.shape:
             decoded = decoded[tuple(slice(0, n) for n in chunk_spec.shape)]
         return decoded[selection]  # type: ignore[no-any-return]
+
+    def _position(self, chunk_spec: ArraySpec) -> int:
+        if chunk_spec.chunk_coords is None:
+            raise NotImplementedError(
+                "The switch codec was not told which chunk this is. It must be the "
+                "array's only codec, in a reader that passes chunk coordinates."
+            )
+        return chunk_spec.chunk_coords[self.axis]
+
+    async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
+        _, spec, codecs_json, _ = self._resolve(self._position(chunk_spec), chunk_spec)
+        (decoded,) = await _pipeline(codecs_json, spec).decode([(chunk_bytes, spec)])
+        if spec.shape != chunk_spec.shape:
+            decoded = decoded[tuple(slice(0, n) for n in chunk_spec.shape)]
+        return decoded  # type: ignore[no-any-return]
+
+    async def _encode_single(self, chunk_array: NDBuffer, chunk_spec: ArraySpec) -> Buffer | None:
+        """Encode a chunk with its case's chain, padded to the case's stored shape."""
+        _, spec, codecs_json, _ = self._resolve(self._position(chunk_spec), chunk_spec)
+        if spec.shape != chunk_spec.shape:
+            padded = chunk_spec.prototype.nd_buffer.create(
+                shape=spec.shape,
+                dtype=chunk_spec.dtype.to_native_dtype(),
+                order=chunk_spec.order,
+                fill_value=spec.fill_value,
+            )
+            padded[tuple(slice(0, n) for n in chunk_spec.shape)] = chunk_array
+            chunk_array = padded
+        (encoded,) = await _pipeline(codecs_json, spec).encode([(chunk_array, spec)])
+        return encoded  # type: ignore[no-any-return]
 
     @staticmethod
     def _filled(selection: SelectorTuple, chunk_spec: ArraySpec, fill: Any) -> NDBuffer:
@@ -207,12 +250,6 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             fill_value=fill,
         )
         return out.reshape(indexer.sel_shape) if hasattr(indexer, "sel_shape") else out
-
-    async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
-        raise NotImplementedError("The switch codec must be the array's only codec.")
-
-    async def _encode_single(self, chunk_array: NDBuffer, chunk_spec: ArraySpec) -> Buffer | None:
-        raise NotImplementedError("The switch codec is read-only.")
 
 
 def rle_cases(

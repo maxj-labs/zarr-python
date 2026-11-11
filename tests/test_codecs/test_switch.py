@@ -171,7 +171,7 @@ def test_shards_are_read_by_range() -> None:
     assert 0 < Counting.nbytes < whole / 2
 
 
-def test_must_be_the_only_codec_and_is_read_only() -> None:
+def test_must_be_the_only_codec() -> None:
     cases = [{"chunks": 1, "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}]}]
     with pytest.raises(ValueError, match="only codec"):
         zarr.create_array(
@@ -184,19 +184,52 @@ def test_must_be_the_only_codec_and_is_read_only() -> None:
             compressors=GzipCodec(),
             filters=None,
         )
-    arr = zarr.create_array(
-        MemoryStore(),
-        name="x",
-        shape=(2,),
-        chunks=(2,),
-        dtype="int8",
-        serializer=SwitchCodec(axis=0, cases=cases),
-        compressors=None,
-        filters=None,
-    )
-    with pytest.raises(NotImplementedError, match="read-only"):
-        arr[:] = 1
     assert isinstance(BytesCodec(), BytesCodec)
+
+
+def test_writes_encode_each_chunk_with_its_case() -> None:
+    """Writing through the array gives the bytes each case's own chain would write."""
+    rng = np.random.default_rng(2)
+    data = rng.integers(0, 50, size=(9, 4, 3)).astype("int32")
+    store = MemoryStore()
+    # references: the same data written by plain arrays, one per case
+    a = zarr.create_array(store, name="a", data=data[:4], chunks=(2, 4, 3), compressors=GzipCodec())
+    b = zarr.create_array(store, name="b", data=data[4:], chunks=(3, 4, 3), compressors=None)
+    with zarr.config.set({"array.rectilinear_chunks": True}):
+        j = zarr.create_array(
+            store,
+            name="j",
+            shape=(9, 4, 3),
+            chunks=[[2, 2, 3, 2], [4], [3]],  # the last chunk of `b` is cut short
+            dtype="int32",
+            serializer=SwitchCodec(
+                axis=0,
+                cases=[
+                    {"chunks": 2, "codecs": _codec_dicts(a)},
+                    {"chunks": 2, "codecs": _codec_dicts(b), "encoded_chunk_shape": [3, 4, 3]},
+                ],
+            ),
+            compressors=None,
+            filters=None,
+        )
+        j[:] = data
+        np.testing.assert_array_equal(j[:], data)
+        j[3:6, 1, :] = -1  # a partial write: read, change, encode again
+        data[3:6, 1, :] = -1
+        np.testing.assert_array_equal(j[:], data)
+    proto = default_buffer_prototype()
+    # an uncompressed chunk of `b`'s case is stored at its full shape, cut or not
+    for key in ("j/c/2/0/0", "j/c/3/0/0"):
+        stored = sync(store.get(key, proto))
+        assert stored is not None
+        assert len(stored) == 3 * 4 * 3 * 4
+    # a chunk of `a`'s case is what `a`'s chain writes
+    a[:] = data[:4]
+    one = sync(store.get("j/c/0/0/0", proto))
+    two = sync(store.get("a/c/0/0/0", proto))
+    assert one is not None
+    assert two is not None
+    assert one.to_bytes() == two.to_bytes()
 
 
 @pytest.mark.parametrize(
