@@ -18,6 +18,7 @@ ways:
 from __future__ import annotations
 
 import json
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -47,7 +48,43 @@ _CASE_KEYS: Final = {
 }
 
 
-@lru_cache(maxsize=256)
+@dataclass(frozen=True)
+class _Table:
+    """The cases, parsed once, with what is needed to find one in constant time."""
+
+    cases: list[dict[str, Any]]
+    codecs_json: list[str]  # each case's chain, as the key of the pipeline cache
+    ends: list[int]  # by position: the first chunk after each case
+    by_key: dict[bytes, int]  # by key: the case each key names
+    reads_ranges: bool  # some case's chain may read part of a chunk (sharding)
+
+
+@lru_cache(maxsize=64)
+def _table(cases_json: str, select: str) -> _Table:
+    from zarr.core.metadata.v3 import parse_codecs
+
+    cases: list[dict[str, Any]] = json.loads(cases_json)
+    ends, total = [], 0
+    for case in cases:
+        total += case.get("chunks", 0)
+        ends.append(total)
+    by_key = {bytes.fromhex(c["key"]): i for i, c in enumerate(cases)} if select == "key" else {}
+    reads_ranges = False
+    for case in cases:
+        chain = case["codecs"]
+        if len(chain) == 1 and isinstance(
+            parse_codecs(chain)[0], ArrayBytesCodecPartialDecodeMixin
+        ):
+            reads_ranges = True
+            break
+    return _Table(
+        cases, [json.dumps(c["codecs"], sort_keys=True) for c in cases], ends, by_key, reads_ranges
+    )
+
+
+# One entry per distinct chain and chunk shape in use. A record whose every granule
+# has a chain of its own will exceed this and rebuild chains as it reads.
+@lru_cache(maxsize=4096)
 def _pipeline(codecs_json: str, spec: ArraySpec) -> Any:
     from zarr.core.codec_pipeline import BatchedCodecPipeline
     from zarr.core.metadata.v3 import parse_codecs
@@ -56,7 +93,7 @@ def _pipeline(codecs_json: str, spec: ArraySpec) -> Any:
     return BatchedCodecPipeline.from_codecs(codecs).evolve_from_array_spec(spec)
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=4096)
 def _partial_decoder(codecs_json: str, spec: ArraySpec) -> Any:
     """The chain's only codec, when it can decode part of a chunk by itself (sharding)."""
     from zarr.core.metadata.v3 import parse_codecs
@@ -182,9 +219,18 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         object.__setattr__(self, "key_bytes", key_bytes)
 
     @property
+    def _tab(self) -> _Table:
+        # Kept on the instance: finding it by the cases' text costs time in proportion
+        # to that text, which a long table would pay again for every chunk.
+        tab: _Table | None = self.__dict__.get("_table_cache")
+        if tab is None:
+            tab = _table(self.cases_json, self.select)
+            object.__setattr__(self, "_table_cache", tab)
+        return tab
+
+    @property
     def cases(self) -> list[dict[str, Any]]:
-        cases: list[dict[str, Any]] = json.loads(self.cases_json)
-        return cases
+        return self._tab.cases
 
     @classmethod
     def from_dict(cls, data: dict[str, JSON]) -> Self:
@@ -209,19 +255,20 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
 
     # --- finding a chunk's case
 
-    def _case_at(self, index: int) -> dict[str, Any]:
-        start = 0
-        for case in self.cases:
-            start += case["chunks"]
-            if index < start:
-                return case
-        raise IndexError(f"Chunk {index} along axis {self.axis} lies beyond the last case.")
+    def _case_at(self, index: int) -> int:
+        table = self._tab
+        i = bisect_right(table.ends, index)
+        if index < 0 or i == len(table.ends):
+            raise IndexError(f"Chunk {index} along axis {self.axis} lies beyond the last case.")
+        return i
 
-    def _case_named(self, key: bytes) -> dict[str, Any]:
-        for case in self.cases:
-            if case["key"] == key.hex():
-                return case
-        raise ValueError(f"A chunk names the case {key.hex()!r}, which the array does not list.")
+    def _case_named(self, key: bytes) -> int:
+        try:
+            return self._tab.by_key[key]
+        except KeyError:
+            raise ValueError(
+                f"A chunk names the case {key.hex()!r}, which the array does not list."
+            ) from None
 
     def _position(self, chunk_spec: ArraySpec, byte_getter: ByteGetter | None = None) -> int:
         if chunk_spec.chunk_coords is not None:
@@ -236,10 +283,12 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             )
         return int(key.split("/")[-len(chunk_spec.shape) :][self.axis])
 
-    def _resolve(self, case: dict[str, Any], chunk_spec: ArraySpec) -> tuple[ArraySpec, str, bool]:
+    def _resolve(self, index: int, chunk_spec: ArraySpec) -> tuple[ArraySpec, str, bool]:
         """What a case means for a chunk: the spec its chain works with (the stored
         shape, the case's fill value), the chain as JSON, and whether the case has
         a fill value of its own."""
+        table = self._tab
+        case = table.cases[index]
         encoded_shape = tuple(
             n if e is None else e
             for e, n in zip(
@@ -262,7 +311,7 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             config=config,
             prototype=chunk_spec.prototype,
         )
-        return spec, json.dumps(case["codecs"], sort_keys=True), own_fill
+        return spec, table.codecs_json[index], own_fill
 
     # --- decoding
 
@@ -270,6 +319,13 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
     ) -> NDBuffer | None:
         source: Any = byte_getter
+        if self.select == "key" and not self._tab.reads_ranges:
+            # No case reads part of a chunk: one read brings the key and the chunk.
+            whole = await byte_getter.get(prototype=chunk_spec.prototype)
+            if whole is None:
+                return None
+            decoded = await self._decode_single(whole, chunk_spec)
+            return decoded[selection]
         if self.select == "key":
             head = await byte_getter.get(chunk_spec.prototype, RangeByteRequest(0, self.key_bytes))
             if head is None:
