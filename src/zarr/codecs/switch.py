@@ -347,7 +347,7 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                         "each chunk names its case."
                     )
                 self._check_parameters(case)
-                case.setdefault("key", case_key(case, key_bytes).hex())
+                expected = case_key(case, key_bytes).hex()
             elif "parameters" in case or "key" in case:
                 raise ValueError(
                     "With select='position' nothing is stored with a chunk, so a case "
@@ -363,8 +363,7 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                 if isinstance(n, bool) or not isinstance(n, int) or n < 1:
                     raise ValueError(f"A case covers at least one chunk. Got {n!r}.")
             else:
-                key = case["key"]
-                expected = case_key(case, key_bytes).hex()
+                key = case.setdefault("key", expected)
                 if key != expected:
                     raise ValueError(
                         f"A case's key is the first {key_bytes} bytes of the hash of its "
