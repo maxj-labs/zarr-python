@@ -392,3 +392,23 @@ def test_position_cases_are_listed_once_in_metadata() -> None:
     # the earlier form, one entry per run with its own chain, is still read
     earlier: dict[str, Any] = {"name": "switch", "configuration": {"axis": 0, "cases": cases}}
     assert SwitchCodec.from_dict(earlier) == codec
+
+
+def test_a_table_that_does_not_cover_the_array_is_refused() -> None:
+    """By position, an array whose chunks were removed without its table being rewritten
+    is refused when it is opened, not read with its chunks' cases shifted."""
+    codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    cases = [{"chunks": 2, "codecs": codecs}, {"chunks": 2, "codecs": codecs}]
+    store = MemoryStore()
+    with pytest.raises(ValueError, match="cover 4 chunks along axis 0, but the array has 3"):
+        zarr.create_array(
+            store,
+            name="a",
+            shape=(3, 4),
+            chunks=(1, 4),
+            dtype="int16",
+            fill_value=0,
+            serializer=SwitchCodec(axis=0, cases=cases),
+            compressors=None,
+            filters=None,
+        )

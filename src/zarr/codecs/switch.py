@@ -35,7 +35,9 @@ if TYPE_CHECKING:
 
     from zarr.abc.store import ByteGetter, ByteRequest
     from zarr.core.buffer import Buffer, BufferPrototype, NDBuffer
+    from zarr.core.dtype.wrapper import TBaseDType, TBaseScalar, ZDType
     from zarr.core.indexing import SelectorTuple
+    from zarr.core.metadata.v3 import ChunkGridMetadata
 
 __all__ = ["SwitchCodec", "rle_cases"]
 
@@ -323,6 +325,38 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                 runs.append([seen[text], case["chunks"]])
             configuration = {"axis": self.axis, "cases": listed, "runs": runs}
         return {"name": CODEC_NAME, "configuration": configuration}
+
+    def validate(
+        self,
+        *,
+        shape: tuple[int, ...],
+        dtype: ZDType[TBaseDType, TBaseScalar],
+        chunk_grid: ChunkGridMetadata,
+    ) -> None:
+        """By position, the cases must cover exactly the chunks the array has along the
+        axis. An array whose chunks were added or removed without its table being
+        rewritten is then refused when it is opened, where it would otherwise decode
+        chunks with their neighbours' cases."""
+        if self.select != "position":
+            return
+        from zarr.core.chunk_grids import ChunkGrid
+        from zarr.core.metadata.v3 import RegularChunkGridMetadata
+
+        if self.axis >= len(shape):
+            raise ValueError(f"axis {self.axis} is out of bounds for an array of shape {shape}.")
+        sizes: Any = (
+            chunk_grid.chunk_shape
+            if isinstance(chunk_grid, RegularChunkGridMetadata)
+            else chunk_grid.chunk_shapes
+        )
+        chunks = ChunkGrid.from_sizes(shape, sizes).grid_shape[self.axis]
+        covered = self._tab.ends[-1]
+        if covered != chunks:
+            raise ValueError(
+                f"The switch codec's cases cover {covered} chunks along axis {self.axis}, but "
+                f"the array has {chunks}. The table must be rewritten whenever chunks are "
+                "added, removed or moved."
+            )
 
     def compute_encoded_size(self, input_byte_length: int, chunk_spec: ArraySpec) -> int:
         raise NotImplementedError
