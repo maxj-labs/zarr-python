@@ -8,6 +8,7 @@ import pytest
 import zarr
 import zarr.abc.store
 from zarr.codecs import BytesCodec, GzipCodec, ShardingCodec, SwitchCodec, ZstdCodec
+from zarr.codecs.switch import case_key
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
 from zarr.storage import MemoryStore
@@ -300,11 +301,12 @@ def test_select_by_key() -> None:
         chunks=(1, 3, 2),
         compressors=ZstdCodec(),
     )
-    key_a, key_b = b"\x0a" * 4, b"\x0b" * 4
-    cases = [
-        {"key": key_b.hex(), "codecs": _codec_dicts(b), "coalesce_max_gap_bytes": 0},
-        {"key": key_a.hex(), "codecs": _codec_dicts(a)},
+    # a key is the hash of its case, cut to the key length; left out here, it is filled in
+    cases: list[dict[str, Any]] = [
+        {"codecs": _codec_dicts(b), "coalesce_max_gap_bytes": 0},
+        {"codecs": _codec_dicts(a)},
     ]
+    key_b, key_a = (case_key(c, 4) for c in cases)
     j = zarr.create_array(
         store,
         name="j",
@@ -315,7 +317,9 @@ def test_select_by_key() -> None:
         compressors=None,
         filters=None,
     )
-    assert j.metadata.to_dict()["codecs"][0]["configuration"]["select"] == "key"  # type: ignore[index,call-overload]
+    configuration: Any = j.metadata.to_dict()["codecs"][0]["configuration"]  # type: ignore[index,call-overload]
+    assert configuration["select"] == "key"
+    assert [c["key"] for c in configuration["cases"]] == [key_b.hex(), key_a.hex()]
     # interleave the two sources: a, b, b, a. No run-length table could say that in two cases.
     order = [("a", 0), ("b", 0), ("b", 1), ("a", 1)]
     proto = default_buffer_prototype()
@@ -335,16 +339,112 @@ def test_select_by_key() -> None:
 
 def test_key_cases_are_validated() -> None:
     codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
-    with pytest.raises(ValueError, match="2 bytes of hex"):
-        SwitchCodec(select="key", key_bytes=2, cases=[{"key": "00", "codecs": codecs}])
+    # a key that is not the hash of its case is refused, at any length
+    with pytest.raises(ValueError, match="first 2 bytes of the hash"):
+        SwitchCodec(select="key", key_bytes=2, cases=[{"key": "0000", "codecs": codecs}])
+    with pytest.raises(ValueError, match="first 8 bytes of the hash"):
+        SwitchCodec(select="key", cases=[{"key": "00" * 8, "codecs": codecs}])
+    right = case_key({"codecs": codecs}).hex()
+    assert (
+        SwitchCodec(select="key", cases=[{"key": right, "codecs": codecs}]).cases[0]["key"] == right
+    )
     with pytest.raises(ValueError, match="Two cases"):
-        SwitchCodec(
-            select="key",
-            key_bytes=1,
-            cases=[{"key": "00", "codecs": codecs}, {"key": "00", "codecs": codecs}],
-        )
+        SwitchCodec(select="key", cases=[{"codecs": codecs}, {"codecs": codecs}])
     with pytest.raises(ValueError, match="select='key'"):
         SwitchCodec(select="key", cases=[{"chunks": 1, "codecs": codecs}])
+    with pytest.raises(ValueError, match="key_bytes"):
+        SwitchCodec(select="key", key_bytes=0, cases=[{"codecs": codecs}])
+    with pytest.raises(ValueError, match="select='position'"):
+        SwitchCodec(cases=[{"chunks": 1, "codecs": codecs, "parameters": []}])
+
+
+def test_a_key_names_its_case_by_content() -> None:
+    """The key depends on what the case says and on nothing else: not on the order of
+    its entries, nor on where the case stands in the table. A shorter key is the start
+    of a longer one."""
+    a = {"codecs": [{"name": "bytes", "configuration": {"endian": "little"}}], "fill_value": 1}
+    reordered = {
+        "fill_value": 1,
+        "codecs": [{"configuration": {"endian": "little"}, "name": "bytes"}],
+    }
+    b = {"codecs": [{"name": "bytes", "configuration": {"endian": "big"}}]}
+    assert case_key(a) == case_key(reordered) != case_key(b)
+    assert case_key(a, 2) == case_key(a, 16)[:2]
+    assert case_key({**a, "key": "ff", "chunks": 3}) == case_key(a)
+    one = SwitchCodec(select="key", cases=[a, b])
+    other = SwitchCodec(select="key", cases=[b, reordered])
+    assert {c["key"] for c in one.cases} == {c["key"] for c in other.cases}
+
+
+def test_short_keys_that_collide_are_refused() -> None:
+    """With one-byte keys, enough cases will share a key; the codec says so."""
+    cases = [
+        {"codecs": [{"name": "bytes", "configuration": {"endian": "little"}}], "fill_value": i}
+        for i in range(300)
+    ]
+    with pytest.raises(ValueError, match="Use a longer key"):
+        SwitchCodec(select="key", key_bytes=1, cases=cases)
+    assert len(SwitchCodec(select="key", key_bytes=8, cases=cases).cases) == 300
+
+
+def test_parameters_after_the_key() -> None:
+    """A case may leave values of its chain open. Each chunk carries its own after its
+    key, so chunks packed with different numbers share one case."""
+    store = MemoryStore()
+    case: dict[str, Any] = {
+        "parameters": ["float64", "float64"],
+        "codecs": [
+            {
+                "name": "scale_offset",
+                "configuration": {"offset": {"parameter": 0}, "scale": {"parameter": 1}},
+            },
+            {"name": "bytes", "configuration": {"endian": "little"}},
+        ],
+    }
+    plain = {"codecs": [{"name": "bytes", "configuration": {"endian": "little"}}]}
+    codec = SwitchCodec(select="key", cases=[case, plain])
+    assert SwitchCodec.from_dict(codec.to_dict()) == codec
+    zarr.create_array(
+        store,
+        name="a",
+        shape=(8, 4),
+        chunks=(2, 4),
+        dtype="float64",
+        fill_value=-1,
+        serializer=codec,
+        compressors=None,
+        filters=None,
+    )
+    proto = default_buffer_prototype()
+    values = np.arange(8, dtype="<f8").reshape(2, 4)
+    packing = [(10.0, 2.0), (-3.0, 0.5)]
+    for i, (offset, scale) in enumerate(packing):
+        header = case_key(case) + np.array([offset, scale], dtype="<f8").tobytes()
+        stored = ((values - offset) * scale).astype("<f8").tobytes()
+        sync(store.set(f"a/c/{i}/0", proto.buffer.from_bytes(header + stored)))
+    sync(store.set("a/c/2/0", proto.buffer.from_bytes(case_key(plain) + values.tobytes())))
+    # a chunk that is its key and values alone stores nothing
+    lone = case_key(case) + np.array([1.0, 1.0], dtype="<f8").tobytes()
+    sync(store.set("a/c/3/0", proto.buffer.from_bytes(lone)))
+    array = zarr.open_array(store, path="a", mode="r")
+    expected = np.concatenate([values, values, values, np.full((2, 4), -1.0)])
+    np.testing.assert_array_equal(array[:], expected)
+    np.testing.assert_array_equal(array[1:6, 1:3], expected[1:6, 1:3])
+    assert array[3, 2] == expected[3, 2]
+
+
+def test_parameters_are_validated() -> None:
+    bytes_codec = {"name": "bytes", "configuration": {"endian": "little"}}
+    open_chain = [
+        {"name": "scale_offset", "configuration": {"offset": {"parameter": 0}}},
+        bytes_codec,
+    ]
+    with pytest.raises(ValueError, match="declares 0 parameters"):
+        SwitchCodec(select="key", cases=[{"codecs": open_chain}])
+    with pytest.raises(ValueError, match="declares 2 parameters"):
+        SwitchCodec(select="key", cases=[{"codecs": open_chain, "parameters": ["float64", "int8"]}])
+    with pytest.raises(ValueError, match="parameters are a list"):
+        SwitchCodec(select="key", cases=[{"codecs": open_chain, "parameters": ["complex64"]}])
 
 
 def test_a_key_alone_reads_as_the_cases_fill_value() -> None:
@@ -352,10 +452,9 @@ def test_a_key_alone_reads_as_the_cases_fill_value() -> None:
     case's fill value, which may differ from the array's."""
     store = MemoryStore()
     codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
-    cases = [
-        {"key": "0a", "codecs": codecs, "fill_value": -9999.0},
-        {"key": "0b", "codecs": codecs},
-    ]
+    cases: list[dict[str, Any]] = [{"codecs": codecs, "fill_value": -9999.0}, {"codecs": codecs}]
+    key_a, key_b = (case_key(c, 1) for c in cases)
+    assert key_a != key_b
     zarr.create_array(
         store,
         name="a",
@@ -369,8 +468,8 @@ def test_a_key_alone_reads_as_the_cases_fill_value() -> None:
     )
     proto = default_buffer_prototype()
     data = np.arange(8, dtype="<f4").reshape(2, 4)
-    sync(store.set("a/c/0/0", proto.buffer.from_bytes(b"\x0a")))
-    sync(store.set("a/c/1/0", proto.buffer.from_bytes(b"\x0b" + data.tobytes())))
+    sync(store.set("a/c/0/0", proto.buffer.from_bytes(key_a)))
+    sync(store.set("a/c/1/0", proto.buffer.from_bytes(key_b + data.tobytes())))
     array = zarr.open_array(store, path="a", mode="r")
     expected = np.concatenate([np.full((2, 4), -9999.0), data, np.zeros((2, 4))])
     np.testing.assert_array_equal(array[:], expected)

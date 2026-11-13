@@ -10,6 +10,14 @@ ways:
   case. The chunk describes itself, so it can be moved, re-keyed or nested
   without the codec knowing where it is. The store has to supply the key in
   front of the chunk (a virtual reference with a literal prefix does).
+
+  A key is the first ``key_bytes`` bytes of the SHA-256 of its case's canonical
+  JSON (`case_key`), so it names the case by its content: two writers that meet
+  the same case give it the same key, and tables merge by union. A case may
+  leave values of its chain open (``{"parameter": k}``) and declare their data
+  types in ``parameters``; each chunk then carries its own values after the key.
+  The key and the parameter layout follow the ``switch`` codec of refkv
+  (d-v-b/refkv pull request 73).
 - ``"select": "position"``: each case covers runs of chunks along one axis,
   and the chunk's grid position picks the case. Nothing is stored per chunk,
   but the codec has to be told which chunk it is decoding. In metadata the
@@ -18,11 +26,14 @@ ways:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
+
+import numpy as np
 
 from zarr.abc.codec import ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin
 from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
@@ -39,7 +50,7 @@ if TYPE_CHECKING:
     from zarr.core.indexing import SelectorTuple
     from zarr.core.metadata.v3 import ChunkGridMetadata
 
-__all__ = ["SwitchCodec", "rle_cases"]
+__all__ = ["SwitchCodec", "case_key", "rle_cases"]
 
 CODEC_NAME: Final = "switch"
 _CASE_KEYS: Final = {
@@ -49,7 +60,58 @@ _CASE_KEYS: Final = {
     "encoded_chunk_shape",
     "fill_value",
     "coalesce_max_gap_bytes",
+    "parameters",
 }
+_PARAMETER_TYPES: Final = (
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "float32",
+    "float64",
+)
+
+
+def case_key(case: dict[str, Any], key_bytes: int = 8) -> bytes:
+    """The key of a case: the first `key_bytes` bytes of the SHA-256 of its canonical
+    JSON (sorted keys, no whitespace, UTF-8), leaving out ``key`` and ``chunks``.
+
+    A shorter key is still an address of the case's content; it only makes it likelier
+    that two cases share a key, which the codec refuses.
+    """
+    body = {k: v for k, v in case.items() if k not in ("key", "chunks")}
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode()).digest()[:key_bytes]
+
+
+def _fill_parameters(codecs_json: str, values: tuple[Any, ...]) -> str:
+    """The chain with each ``{"parameter": k}`` replaced by the chunk's k-th value."""
+
+    def fill(node: Any) -> Any:
+        if isinstance(node, dict):
+            if set(node) == {"parameter"}:
+                return values[node["parameter"]]
+            return {k: fill(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [fill(v) for v in node]
+        return node
+
+    return json.dumps(fill(json.loads(codecs_json)), sort_keys=True)
+
+
+def _open_parameters(node: Any) -> set[int]:
+    """The parameters a chain leaves open."""
+    if isinstance(node, dict):
+        if set(node) == {"parameter"}:
+            return {node["parameter"]}
+        return set().union(*(_open_parameters(v) for v in node.values()))
+    if isinstance(node, list):
+        return set().union(*(_open_parameters(v) for v in node))
+    return set()
 
 
 @dataclass(frozen=True)
@@ -61,6 +123,7 @@ class _Table:
     ends: list[int]  # by position: the first chunk after each case
     by_key: dict[bytes, int]  # by key: the case each key names
     reads_ranges: bool  # some case's chain may read part of a chunk (sharding)
+    parameters: list[Any]  # by key: the data type of each case's values, or None
 
 
 @lru_cache(maxsize=64)
@@ -76,13 +139,26 @@ def _table(cases_json: str, select: str) -> _Table:
     reads_ranges = False
     for case in cases:
         chain = case["codecs"]
-        if len(chain) == 1 and isinstance(
-            parse_codecs(chain)[0], ArrayBytesCodecPartialDecodeMixin
+        if (
+            len(chain) == 1
+            and not case.get("parameters")
+            and isinstance(parse_codecs(chain)[0], ArrayBytesCodecPartialDecodeMixin)
         ):
             reads_ranges = True
             break
+    parameters = [
+        np.dtype([(f"p{k}", np.dtype(t).newbyteorder("<")) for k, t in enumerate(c["parameters"])])
+        if c.get("parameters")
+        else None
+        for c in cases
+    ]
     return _Table(
-        cases, [json.dumps(c["codecs"], sort_keys=True) for c in cases], ends, by_key, reads_ranges
+        cases,
+        [json.dumps(c["codecs"], sort_keys=True) for c in cases],
+        ends,
+        by_key,
+        reads_ranges,
+        parameters,
     )
 
 
@@ -202,7 +278,11 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
 
         - ``codecs``: the codec chain of its chunks;
         - ``key`` (with ``select="key"``): the hex of the bytes that a chunk of
-          this case begins with;
+          this case begins with, which must be `case_key` of the case. It may be
+          left out, and is then filled in;
+        - ``parameters`` (optional, with ``select="key"``): the data types of the
+          values each chunk carries after its key, little-endian, in order. The
+          chain refers to the k-th as ``{"parameter": k}``;
         - ``chunks`` (with ``select="position"``): the number of chunks along
           `axis` that the case covers; the cases are then in order along it;
         - ``encoded_chunk_shape`` (optional): the shape a stored chunk decodes
@@ -219,7 +299,9 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     axis : int
         With ``select="position"``, the axis along which the cases lie.
     key_bytes : int
-        With ``select="key"``, the length of the key in front of every chunk.
+        With ``select="key"``, the length of the key in front of every chunk: this
+        many leading bytes of the case's hash. Shorter keys save space in every
+        reference and make it likelier that two cases collide.
 
     Notes
     -----
@@ -252,9 +334,25 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             raise ValueError(f"select must be 'position' or 'key'. Got {select!r}.")
         if not cases:
             raise ValueError("The switch codec needs at least one case.")
-        required = {"codecs", "chunks" if select == "position" else "key"}
+        length: object = key_bytes
+        if isinstance(length, bool) or not isinstance(length, int) or not 1 <= length <= 32:
+            raise ValueError(f"key_bytes must be an integer from 1 to 32. Got {key_bytes!r}.")
+        required = {"codecs", "chunks"} if select == "position" else {"codecs"}
         seen: set[str] = set()
         for case in cases:
+            if select == "key":
+                if "chunks" in case:
+                    raise ValueError(
+                        "With select='key' a case does not say which chunks it covers: "
+                        "each chunk names its case."
+                    )
+                self._check_parameters(case)
+                case.setdefault("key", case_key(case, key_bytes).hex())
+            elif "parameters" in case or "key" in case:
+                raise ValueError(
+                    "With select='position' nothing is stored with a chunk, so a case "
+                    "has no key and no parameters."
+                )
             if not required <= set(case) <= _CASE_KEYS:
                 raise ValueError(
                     f"With select={select!r} a case has {sorted(required)}, and optionally "
@@ -266,15 +364,48 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                     raise ValueError(f"A case covers at least one chunk. Got {n!r}.")
             else:
                 key = case["key"]
-                if not isinstance(key, str) or len(bytes.fromhex(key)) != key_bytes:
-                    raise ValueError(f"A case's key is {key_bytes} bytes of hex. Got {key!r}.")
+                expected = case_key(case, key_bytes).hex()
+                if key != expected:
+                    raise ValueError(
+                        f"A case's key is the first {key_bytes} bytes of the hash of its "
+                        f"contents, {expected!r} here. Got {key!r}."
+                    )
                 if key in seen:
-                    raise ValueError(f"Two cases have the key {key!r}.")
+                    raise ValueError(
+                        f"Two cases have the key {key!r}. Use a longer key: {key_bytes} "
+                        "bytes do not tell these cases apart."
+                    )
                 seen.add(key)
         object.__setattr__(self, "axis", axis)
         object.__setattr__(self, "cases_json", json.dumps(cases, sort_keys=True))
         object.__setattr__(self, "select", select)
         object.__setattr__(self, "key_bytes", key_bytes)
+
+    @staticmethod
+    def _check_parameters(case: dict[str, Any]) -> None:
+        declared = case.get("parameters", [])
+        if not isinstance(declared, list) or any(t not in _PARAMETER_TYPES for t in declared):
+            raise ValueError(
+                f"A case's parameters are a list of {', '.join(_PARAMETER_TYPES)}. Got {declared!r}."
+            )
+        used = _open_parameters(case.get("codecs"))
+        if used != set(range(len(declared))):
+            raise ValueError(
+                f"A case declares {len(declared)} parameters and its chain uses {sorted(used)}."
+            )
+
+    def _header(self, case: int) -> int:
+        """How many leading bytes of a chunk of this case are its key and values."""
+        dtype = self._tab.parameters[case]
+        return self.key_bytes + (0 if dtype is None else dtype.itemsize)
+
+    def _chain(self, case: int, codecs_json: str, header: bytes) -> str:
+        """The case's chain, completed with the values in a chunk's header."""
+        dtype = self._tab.parameters[case]
+        if dtype is None:
+            return codecs_json
+        values = np.frombuffer(header[self.key_bytes :], dtype=dtype, count=1)[0]
+        return _fill_parameters(codecs_json, tuple(v.item() for v in values))
 
     @property
     def _tab(self) -> _Table:
@@ -439,11 +570,14 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             if head is None:
                 return None  # nothing stored: the array's fill value
             case = self._case_named(head.to_bytes())
-            source = _after_key(byte_getter, self.key_bytes)
+            source = _after_key(byte_getter, self._header(case))
         else:
             case = self._case_at(self._position(chunk_spec, byte_getter))
         spec, codecs_json, own_fill = self._resolve(case, chunk_spec)
-        inner = _partial_decoder(codecs_json, spec)
+        # a case with parameters is read whole below: its chain is not known until then
+        inner = (
+            None if self._tab.parameters[case] is not None else _partial_decoder(codecs_json, spec)
+        )
         if inner is not None and own_fill and self.select == "key":
             from zarr.codecs.sharding import ShardingCodec
 
@@ -465,11 +599,13 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             # Read the chunk with its key and drop the key here: asking a store for
             # "everything after the key" fails where the chunk is the key alone.
             whole = await byte_getter.get(prototype=chunk_spec.prototype)
-            chunk_bytes = (
-                None
-                if whole is None
-                else chunk_spec.prototype.buffer.from_bytes(whole.to_bytes()[self.key_bytes :])
-            )
+            chunk_bytes = None
+            if whole is not None:
+                raw = whole.to_bytes()
+                n = self._header(case)
+                if len(raw) > n:
+                    codecs_json = self._chain(case, codecs_json, raw[:n])
+                chunk_bytes = chunk_spec.prototype.buffer.from_bytes(raw[n:])
         if chunk_bytes is None or len(chunk_bytes) == 0:
             # A key with nothing after it is a chunk that stores nothing but still
             # names its case. None makes the reader use the array's fill value.
@@ -483,16 +619,19 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         if self.select == "key":
             raw = chunk_bytes.to_bytes()
             case = self._case_named(raw[: self.key_bytes])
-            if len(raw) == self.key_bytes:
-                # A key and nothing else: the chunk stores no data and reads as its
-                # case's fill value.
+            n = self._header(case)
+            if len(raw) <= n:
+                # A key (and its values) and nothing else: the chunk stores no data
+                # and reads as its case's fill value.
                 spec, _, _ = self._resolve(case, chunk_spec)
                 whole = tuple(slice(0, n) for n in chunk_spec.shape)
                 return self._filled(whole, chunk_spec, spec.fill_value)
-            chunk_bytes = chunk_spec.prototype.buffer.from_bytes(raw[self.key_bytes :])
+            chunk_bytes = chunk_spec.prototype.buffer.from_bytes(raw[n:])
+            spec, codecs_json, _ = self._resolve(case, chunk_spec)
+            codecs_json = self._chain(case, codecs_json, raw[:n])
         else:
             case = self._case_at(self._position(chunk_spec))
-        spec, codecs_json, _ = self._resolve(case, chunk_spec)
+            spec, codecs_json, _ = self._resolve(case, chunk_spec)
         (decoded,) = await _pipeline(codecs_json, spec).decode([(chunk_bytes, spec)])
         if spec.shape != chunk_spec.shape:
             decoded = decoded[tuple(slice(0, n) for n in chunk_spec.shape)]
