@@ -375,3 +375,20 @@ def test_a_key_alone_reads_as_the_cases_fill_value() -> None:
     expected = np.concatenate([np.full((2, 4), -9999.0), data, np.zeros((2, 4))])
     np.testing.assert_array_equal(array[:], expected)
     np.testing.assert_array_equal(array[1:5, 1:3], expected[1:5, 1:3])
+
+
+def test_position_cases_are_listed_once_in_metadata() -> None:
+    """Layouts that alternate cost a pair of integers per run in metadata, not a chain."""
+    a = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    b = [*a, {"name": "gzip", "configuration": {"level": 1}}]
+    cases = [{"chunks": 1, "codecs": a if i % 2 == 0 else b} for i in range(6)]
+    codec = SwitchCodec(axis=0, cases=cases)
+    configuration = codec.to_dict()["configuration"]
+    assert isinstance(configuration, dict)
+    assert configuration["cases"] == [{"codecs": a}, {"codecs": b}]
+    assert configuration["runs"] == [[0, 1], [1, 1], [0, 1], [1, 1], [0, 1], [1, 1]]
+    again = SwitchCodec.from_dict(codec.to_dict())
+    assert again == codec
+    # the earlier form, one entry per run with its own chain, is still read
+    earlier: dict[str, Any] = {"name": "switch", "configuration": {"axis": 0, "cases": cases}}
+    assert SwitchCodec.from_dict(earlier) == codec

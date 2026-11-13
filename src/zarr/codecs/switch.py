@@ -10,9 +10,10 @@ ways:
   case. The chunk describes itself, so it can be moved, re-keyed or nested
   without the codec knowing where it is. The store has to supply the key in
   front of the chunk (a virtual reference with a literal prefix does).
-- ``"select": "position"``: each case covers a run of chunks along one axis,
+- ``"select": "position"``: each case covers runs of chunks along one axis,
   and the chunk's grid position picks the case. Nothing is stored per chunk,
-  but the codec has to be told which chunk it is decoding.
+  but the codec has to be told which chunk it is decoding. In metadata the
+  cases are listed once and ``runs`` gives ``[case, chunks]`` pairs in order.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import json
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from zarr.abc.codec import ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin
 from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
@@ -290,8 +291,14 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     @classmethod
     def from_dict(cls, data: dict[str, JSON]) -> Self:
         _, configuration = parse_named_configuration(data, CODEC_NAME)
+        cases: Any = configuration["cases"]
+        if "runs" in configuration:
+            # each case is listed once; `runs` says which case each run of chunks uses
+            listed = cast("list[dict[str, Any]]", cases)
+            runs = cast("list[list[int]]", configuration["runs"])
+            cases = [{"chunks": n, **listed[i]} for i, n in runs]
         return cls(
-            cases=configuration["cases"],
+            cases=cases,
             axis=configuration.get("axis", 0),  # type: ignore[arg-type]
             select=configuration.get("select", "position"),  # type: ignore[arg-type]
             key_bytes=configuration.get("key_bytes", 8),  # type: ignore[arg-type]
@@ -302,7 +309,19 @@ class SwitchCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
         if self.select == "key":
             configuration = {"select": "key", "key_bytes": self.key_bytes, "cases": self.cases}
         else:
-            configuration = {"axis": self.axis, "cases": self.cases}
+            # A case is written once however many runs use it, so that layouts which
+            # come and go cost a pair of integers per run and not a codec chain.
+            listed: list[dict[str, Any]] = []
+            seen: dict[str, int] = {}
+            runs: list[list[int]] = []
+            for case in self.cases:
+                body = {k: v for k, v in case.items() if k != "chunks"}
+                text = json.dumps(body, sort_keys=True)
+                if text not in seen:
+                    seen[text] = len(listed)
+                    listed.append(body)
+                runs.append([seen[text], case["chunks"]])
+            configuration = {"axis": self.axis, "cases": listed, "runs": runs}
         return {"name": CODEC_NAME, "configuration": configuration}
 
     def compute_encoded_size(self, input_byte_length: int, chunk_spec: ArraySpec) -> int:
